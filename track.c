@@ -2020,7 +2020,9 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
             PPforward;
             changeTentative = 1;
         }
-        if (a->squawkTentative == mm->squawk && now - a->squawkTentativeChanged > 750 && accept_data(&a->squawk_valid, mm->source, mm, a, REDUCE_RARE)) {
+        if (
+                (mm->source == SOURCE_JAERO || (a->squawkTentative == mm->squawk && now - a->squawkTentativeChanged > 750))
+                && accept_data(&a->squawk_valid, mm->source, mm, a, REDUCE_RARE)) {
             if (mm->squawk != a->squawk) {
                 a->modeA_hit = 0;
             }
@@ -2223,6 +2225,18 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
 
     if (mm->spi_valid && accept_data(&a->spi_valid, mm->source, mm, a, REDUCE_RARE)) {
         a->spi = mm->spi;
+    }
+
+    if (mm->wind_valid) {
+        a->wind_speed = a->wind_speed;
+        a->wind_direction = a->wind_direction;
+        a->wind_updated = now;
+        a->wind_altitude = a->baro_alt;
+    }
+
+    if (mm->oat_valid) {
+        a->oat = mm->oat;
+        a->oat_updated = now;
     }
 
     // CPR, even
@@ -2786,6 +2800,8 @@ static void removeStaleRange(void *arg, threadpool_threadbuffers_t * buffer_grou
         nonIcaoPosTimeout = now - 26 * HOURS;
     }
 
+    // aircraft with valid position are never pruned (fix for very long jaero-timeout settings)
+
     // timeout for aircraft without position
     int64_t noposTimeout = now - 5 * MINUTES;
 
@@ -2797,7 +2813,8 @@ static void removeStaleRange(void *arg, threadpool_threadbuffers_t * buffer_grou
                     (!a->seenPosReliable && a->seen < noposTimeout)
                     || (
                         a->seenPosReliable &&
-                        (a->seenPosReliable < posTimeout || ((a->addr & MODES_NON_ICAO_ADDRESS) && a->seenPosReliable < nonIcaoPosTimeout))
+                        (a->seenPosReliable < posTimeout || ((a->addr & MODES_NON_ICAO_ADDRESS) && a->seenPosReliable < nonIcaoPosTimeout)) &&
+                        a->pos_reliable_valid.source == SOURCE_INVALID
                        )
                ) {
                 // Count aircraft where we saw only one message before reaping them.
@@ -3245,8 +3262,10 @@ void to_state_all(struct aircraft *a, struct state_all *new, int64_t now) {
     }
     if (now < a->oat_updated + TRACK_EXPIRE) {
         new->oat = (int) nearbyint(a->oat);
-        new->tat = (int) nearbyint(a->tat);
-        new->temp_valid = 1;
+        if (now < a->tat_updated + TRACK_EXPIRE) {
+            new->temp_valid = 1;
+            new->tat = (int) nearbyint(a->tat);
+        }
     }
 
     if (a->adsb_version < 0)
@@ -3496,7 +3515,7 @@ void updateValidities(struct aircraft *a, int64_t now) {
         a->category = 0;
 
     // reset position reliability when no position was received for 60 minutes
-    if (a->pos_reliable_odd != 0 && a->pos_reliable_even != 0 && elapsed_seen_global > POS_RELIABLE_TIMEOUT) {
+    if (a->pos_reliable_odd != 0 && a->pos_reliable_even != 0 && elapsed_seen_global > POS_RELIABLE_TIMEOUT && a->pos_reliable_valid.source == SOURCE_INVALID) {
         a->pos_reliable_odd = 0;
         a->pos_reliable_even = 0;
     }

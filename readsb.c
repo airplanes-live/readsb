@@ -223,7 +223,7 @@ static void configSetDefaults(void) {
     Modes.ping_reduce = PING_REDUCE;
     Modes.ping_reject = PING_REJECT;
 
-    Modes.binCraftVersion = 20220916;
+    Modes.binCraftVersion = 20240218;
     Modes.messageRateMult = 1.0f;
 
     Modes.apiShutdownDelay = 0 * SECONDS;
@@ -1342,6 +1342,8 @@ static int make_net_connector(char *arg) {
             && strcmp(con->protocol, "sbs_out_mlat") != 0
             && strcmp(con->protocol, "sbs_out_jaero") != 0
             && strcmp(con->protocol, "sbs_out_prio") != 0
+            && strcmp(con->protocol, "asterix_out") != 0
+            && strcmp(con->protocol, "asterix_in") != 0
             && strcmp(con->protocol, "json_out") != 0
             && strcmp(con->protocol, "feedmap_out") != 0
             && strcmp(con->protocol, "gpsd_in") != 0
@@ -1352,6 +1354,7 @@ static int make_net_connector(char *arg) {
         fprintf(stderr, "Supported protocols: beast_out, beast_in, beast_reduce_out, beast_reduce_plus_out, raw_out, raw_in, \n"
                 "sbs_out, sbs_out_replay, sbs_out_mlat, sbs_out_jaero, \n"
                 "sbs_in, sbs_in_mlat, sbs_in_jaero, \n"
+                "sbs_out_prio, asterix_out, asterix_in, \n"
                 "vrs_out, json_out, gpsd_in, uat_in, \n"
                 "planefinder_in\n");
         return 1;
@@ -1566,7 +1569,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
 
         case OptJaeroTimeout:
-            Modes.trackExpireJaero = (uint32_t) (atof(arg) * MINUTES);
+            Modes.trackExpireJaero = (int64_t) (atof(arg) * MINUTES);
             break;
         case OptPositionPersistence:
             Modes.position_persistence = imax(0, atoi(arg));
@@ -1638,6 +1641,17 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptNetBiPorts:
             sfree(Modes.net_input_beast_ports);
             Modes.net_input_beast_ports = strdup(arg);
+            break;
+        case OptNetAsterixOutPorts:
+            sfree(Modes.net_output_asterix_ports);
+            Modes.net_output_asterix_ports = strdup(arg);
+            break;
+	case OptNetAsterixInPorts:
+	    sfree(Modes.net_input_asterix_ports);
+	    Modes.net_input_asterix_ports = strdup(arg);
+	    break;
+        case OptNetAsterixReduce:
+            Modes.asterixReduce = 1;
             break;
         case OptNetBeastReducePorts:
             sfree(Modes.net_output_beast_reduce_ports);
@@ -1932,9 +1946,19 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptBladeDecim:
         case OptBladeBw:
 #endif
+#ifdef ENABLE_HACKRF
+	case OptHackRfGainEnable:
+        case OptHackRfVgaGain:
+#endif
 #ifdef ENABLE_PLUTOSDR
         case OptPlutoUri:
         case OptPlutoNetwork:
+#endif
+#ifdef ENABLE_SOAPYSDR
+        case OptSoapyAntenna:
+        case OptSoapyBandwith:
+        case OptSoapyEnableAgc:
+        case OptSoapyGainElement:
 #endif
             if (Modes.sdr_type == SDR_NONE) {
                 fprintf(stderr, "ERROR: SDR / device type specific options must be specified AFTER the --device-type xyz parameter.\n");
@@ -1999,6 +2023,9 @@ int parseCommandLine(int argc, char **argv) {
 #endif
 #ifdef ENABLE_PLUTOSDR
         "ENABLE_PLUTOSDR "
+#endif
+#ifdef ENABLE_SOAPYSDR
+        "ENABLE_SOAPYSDR "
 #endif
 #ifdef SC16Q11_TABLE_BITS
 #define stringize(x) _stringize(x)
