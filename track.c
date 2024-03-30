@@ -1816,7 +1816,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
 
     if (mm->msgtype == DFTYPE_MODEAC) {
         // Mode A/C, just count it (we ignore SPI)
-        modeAC_count[modeAToIndex(mm->squawk)]++;
+        modeAC_count[modeAToIndex(mm->squawkHex)]++;
         res = NULL;
         goto exit;
     }
@@ -1847,12 +1847,12 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         }
     }
 
-    int address_reliable = addressReliable(mm);
+    mm->address_reliable = addressReliable(mm);
 
     // Lookup our aircraft or create a new one
     a = aircraftGet(mm->addr);
     if (!a) { // If it's a currently unknown aircraft....
-        if (address_reliable) {
+        if (mm->address_reliable) {
             a = aircraftCreate(mm->addr); // ., create a new record for it,
         } else {
             //fprintf(stderr, "%06x: !a && !addressReliable(mm)\n", mm->addr);
@@ -1873,7 +1873,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
     }
 
     // only count the aircraft as "seen" for reliable messages with CRC
-    if (address_reliable) {
+    if (mm->address_reliable) {
         a->seen = now;
     }
 
@@ -1882,6 +1882,8 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         res = NULL;
         goto exit;
     }
+
+    a->last_message_crc_fixed = (mm->correctedbits > 0) ? 1 : 0;
 
 
     a->messageRateAcc[0]++;
@@ -1907,7 +1909,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
 
     // reset to 100000 on overflow ... avoid any low message count checks
     if (a->messages == UINT32_MAX)
-        a->messages = UINT16_MAX + 1;
+        a->messages = UINT16_MAX;
 
     a->messages++;
 
@@ -1929,6 +1931,10 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
 
         if (mm->addrtype == ADDR_ADSB_ICAO && a->position_valid.source != SOURCE_ADSB) {
             // don't set to ADS-B without a position
+            if (mm->msgtype == 17) {
+                a->addrtype = ADDR_MODE_S; // set type ModeS for DF17 messages when not knowing position
+                a->addrtype_updated = now;
+            }
         } else {
             a->addrtype = mm->addrtype;
             a->addrtype_updated = now;
@@ -2014,22 +2020,22 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         uint32_t oldsquawk = a->squawk;
 
         int changeTentative = 0;
-        if (a->squawkTentative != mm->squawk && now - a->seen < 15 * SECONDS && will_accept_data(&a->squawk_valid, mm->source, mm, a)) {
+        if (a->squawkTentative != mm->squawkHex && now - a->seen < 15 * SECONDS && will_accept_data(&a->squawk_valid, mm->source, mm, a)) {
             a->squawk_valid.next_reduce_forward = now + currentReduceInterval(now);
             mm->reduce_forward = 1;
             PPforward;
             changeTentative = 1;
         }
         if (
-                (mm->source == SOURCE_JAERO || (a->squawkTentative == mm->squawk && now - a->squawkTentativeChanged > 750))
+                (mm->source == SOURCE_JAERO || (a->squawkTentative == mm->squawkHex && now - a->squawkTentativeChanged > 750))
                 && accept_data(&a->squawk_valid, mm->source, mm, a, REDUCE_RARE)) {
-            if (mm->squawk != a->squawk) {
+            if (mm->squawkHex != a->squawk) {
                 a->modeA_hit = 0;
             }
-            a->squawk = mm->squawk;
+            a->squawk = mm->squawkHex;
         }
         if (changeTentative) {
-            a->squawkTentative = mm->squawk;
+            a->squawkTentative = mm->squawkHex;
             a->squawkTentativeChanged = now;
         }
 
@@ -2046,7 +2052,7 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
                             a->addr,
                             mm->msgtype,
                             a->squawk,
-                            mm->squawk,
+                            mm->squawkHex,
                             uuid);
                 }
             } else {
@@ -2487,9 +2493,6 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
                 incrementReliable(a, mm, now, 2);
 
                 setPosition(a, mm, now);
-
-                if (a->messages < 2)
-                    a->messages = 2;
             }
         }
     }
@@ -2804,18 +2807,20 @@ static void removeStaleRange(void *arg, threadpool_threadbuffers_t * buffer_grou
 
     // timeout for aircraft without position
     int64_t noposTimeout = now - 5 * MINUTES;
+    int64_t jaeroTimeout = now - Modes.trackExpireJaero;
 
     for (int j = info->from; j < info->to; j++) {
         struct aircraft **nextPointer = &(Modes.aircraft[j]);
         while (*nextPointer) {
             struct aircraft *a = *nextPointer;
             if (
-                    (!a->seenPosReliable && a->seen < noposTimeout)
-                    || (
-                        a->seenPosReliable &&
-                        (a->seenPosReliable < posTimeout || ((a->addr & MODES_NON_ICAO_ADDRESS) && a->seenPosReliable < nonIcaoPosTimeout)) &&
-                        a->pos_reliable_valid.source == SOURCE_INVALID
-                       )
+                    ((!a->seenPosReliable && a->seen < noposTimeout)
+                     || (
+                         a->seenPosReliable &&
+                         (a->seenPosReliable < posTimeout || ((a->addr & MODES_NON_ICAO_ADDRESS) && a->seenPosReliable < nonIcaoPosTimeout))
+                        )
+                    )
+                    && (a->addrtype != ADDR_JAERO || a->seen < jaeroTimeout)
                ) {
                 // Count aircraft where we saw only one message before reaping them.
                 // These are likely to be due to messages with bad addresses.
@@ -3515,7 +3520,7 @@ void updateValidities(struct aircraft *a, int64_t now) {
         a->category = 0;
 
     // reset position reliability when no position was received for 60 minutes
-    if (a->pos_reliable_odd != 0 && a->pos_reliable_even != 0 && elapsed_seen_global > POS_RELIABLE_TIMEOUT && a->pos_reliable_valid.source == SOURCE_INVALID) {
+    if (a->pos_reliable_odd != 0 && a->pos_reliable_even != 0 && elapsed_seen_global > POS_RELIABLE_TIMEOUT) {
         a->pos_reliable_odd = 0;
         a->pos_reliable_even = 0;
     }
@@ -3655,9 +3660,6 @@ static void incrementReliable(struct aircraft *a, struct modesMessage *mm, int64
     float increment = 1.0f;
     if (mm->pos_receiver_range_exceeded) {
         increment = 0.25f;
-    }
-    if (mm->source == SOURCE_SBS) {
-        increment = 0.5f;
     }
 
     if (odd)

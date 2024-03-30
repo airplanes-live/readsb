@@ -149,15 +149,18 @@ static void configSetDefaults(void) {
     Modes.net_sndbuf_size = 2; // Default to 256 kB SNDBUF / RCVBUF
     Modes.net_output_flush_size = 1280; // Default to 1280 Bytes
     Modes.net_output_flush_interval = 50; // Default to 50 ms
+    Modes.net_output_flush_interval_beast_reduce = -1; // default to net_output_flush_interval after config parse if not configured
     Modes.netReceiverId = 0;
     Modes.netIngest = 0;
     Modes.uuidFile = strdup("/usr/local/share/airplanes/airplanes-uuid");
     Modes.json_trace_interval = 20 * 1000;
+    Modes.state_write_interval = 1 * HOURS;
     Modes.heatmap_current_interval = -15;
     Modes.heatmap_interval = 60 * SECONDS;
     Modes.json_reliable = -13;
     Modes.acasFD1 = -1; // set to -1 so it's clear we don't have that fd
     Modes.acasFD2 = -1; // set to -1 so it's clear we don't have that fd
+    Modes.sbsOverrideSquawk = -1;
 
     Modes.currentTask = "unset";
     Modes.joinTimeout = 30 * SECONDS;
@@ -1555,6 +1558,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptStateOnlyOnExit:
             Modes.state_only_on_exit = 1;
             break;
+        case OptStateInterval:
+            Modes.state_write_interval = (int64_t) (atof(arg) * 1.0 * SECONDS);
+            if (Modes.state_write_interval < 59 * SECONDS) {
+                fprintf(stderr, "ERROR: --write-state-every less than 60 seconds (specified: %s)\n", arg);
+                exit(1);
+                Modes.state_write_interval = 1 * HOURS;
+            }
+            break;
         case OptStateDir:
             sfree(Modes.state_parent_dir);
             Modes.state_parent_dir = strdup(arg);
@@ -1620,11 +1631,11 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptNetRoSize:
             Modes.net_output_flush_size = atoi(arg);
             break;
-        case OptNetRoRate:
-            Modes.net_output_flush_interval = 1000 * atoi(arg) / 15; // backwards compatibility
-            break;
-        case OptNetRoIntervall:
+        case OptNetRoInterval:
             Modes.net_output_flush_interval = (int64_t) (1000 * atof(arg));
+            break;
+        case OptNetRoIntervalBeastReduce:
+            Modes.net_output_flush_interval_beast_reduce = (int64_t) (1000 * atof(arg));
             break;
         case OptNetRoPorts:
             sfree(Modes.net_output_raw_ports);
@@ -1828,6 +1839,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                     Modes.ping_reduce = Modes.ping_reject / 2;
                 }
 
+                if (strcasecmp(token[0], "sbs_override_squawk") == 0 && token[1]) {
+                    Modes.sbsOverrideSquawk = atoi(token[1]);
+                }
                 if (strcasecmp(token[0], "messageRateMult") == 0 && token[1]) {
                     Modes.messageRateMult = atof(token[1]);
                 }
@@ -2178,6 +2192,8 @@ static void configAfterParse() {
                 Modes.position_persistence);
     }
 
+    Modes.net_output_flush_size -= 8; // allow for sending 8 byte timestamp in some cases, unfortunate hack
+
     if (Modes.net_output_flush_size > (MODES_OUT_BUF_SIZE)) {
         Modes.net_output_flush_size = MODES_OUT_BUF_SIZE;
     }
@@ -2189,6 +2205,18 @@ static void configAfterParse() {
     }
     if (Modes.net_output_flush_interval < 0)
         Modes.net_output_flush_interval = 0;
+
+    if (Modes.net_output_flush_interval < 51 && Modes.sdr_type != SDR_NONE && !(Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS)) {
+        // the SDR code runs the network tasks about every 50ms
+        // avoid delay by just flushing every call of the network tasks
+        // somewhat hacky, anyone reading this code surprised at this point?
+        Modes.net_output_flush_interval = 0;
+    }
+
+    if (Modes.net_output_flush_interval_beast_reduce < 0) {
+        Modes.net_output_flush_interval_beast_reduce = Modes.net_output_flush_interval;
+    }
+
 
     if (Modes.net_sndbuf_size > (MODES_NET_SNDBUF_MAX)) {
         Modes.net_sndbuf_size = MODES_NET_SNDBUF_MAX;
@@ -2224,10 +2252,10 @@ static void configAfterParse() {
     }
 }
 
-static void notask_save_blob(uint32_t blob) {
+static void notask_save_blob(uint32_t blob, char *stateDir) {
     threadpool_buffer_t pbuffer1 = { 0 };
     threadpool_buffer_t pbuffer2 = { 0 };
-    save_blob(blob, &pbuffer1, &pbuffer2);
+    save_blob(blob, &pbuffer1, &pbuffer2, stateDir);
     free_threadpool_buffer(&pbuffer1);
     free_threadpool_buffer(&pbuffer2);
 }
@@ -2253,9 +2281,53 @@ static void loadReplaceState() {
     free(Modes.replace_state_blob);
     Modes.replace_state_blob = NULL;
 }
+static int checkWriteStateDir(char *baseDir) {
+    if (!baseDir) {
+        return 0;
+    }
+    char filename[PATH_MAX];
+    snprintf(filename, PATH_MAX, "%s/writeState", baseDir);
+    int fd = open(filename, O_RDONLY);
+    if (fd <= 0) {
+        return 0;
+    }
 
-static void checkReplaceState() {
-    if (!Modes.state_dir) {
+    char tmp[3];
+    int len = read(fd, tmp, 2);
+    close(fd);
+
+    tmp[2] = '\0';
+
+    if (len == 0) {
+        // this ignores baseDir and always writes it to state_dir / disk
+        writeInternalState();
+    } else if (len == 2) {
+        uint32_t suffix = strtol(tmp, NULL, 16);
+        notask_save_blob(suffix, baseDir);
+        fprintf(stderr, "save_blob: %02x\n", suffix);
+    }
+
+    unlink(filename);
+    // unlink only after writing state, if the file doesn't exist that's fine as well
+    // this is a hack to detect from a shell script when the task is done
+
+    return 1;
+}
+
+static int checkWriteState() {
+    if (Modes.json_dir) {
+        char getStateDir[PATH_MAX];
+        snprintf(getStateDir, PATH_MAX, "%s/getState", Modes.json_dir);
+        if (checkWriteStateDir(getStateDir)) {
+            return 1;
+        }
+    }
+    return checkWriteStateDir(Modes.state_dir);
+}
+
+
+static void checkReplaceStateDir(char *baseDir) {
+    if (!baseDir) {
         return;
     }
     if (Modes.replace_state_blob) {
@@ -2263,8 +2335,8 @@ static void checkReplaceState() {
     }
     char filename[PATH_MAX];
 
-    snprintf(filename, PATH_MAX, "%s/replaceState", Modes.state_dir);
-    if (!Modes.replace_state_blob && access(filename, R_OK) == 0) {
+    snprintf(filename, PATH_MAX, "%s/replaceState", baseDir);
+    if (access(filename, R_OK) == 0) {
         for (int j = 0; j < STATE_BLOBS; j++) {
             char blob[1024];
             snprintf(blob, 1024, "%s/blob_%02x.zstl", filename, j);
@@ -2279,6 +2351,11 @@ static void checkReplaceState() {
     }
 }
 
+static void checkReplaceState() {
+    checkReplaceStateDir(Modes.state_dir);
+    checkReplaceStateDir(Modes.json_dir);
+}
+
 static void miscStuff(int64_t now) {
 
     checkNewDay(now);
@@ -2290,55 +2367,43 @@ static void miscStuff(int64_t now) {
             nextOutlineWrite = now + 15 * SECONDS;
         }
 
-        if (!Modes.state_only_on_exit) {
-            static int64_t nextRangeDirsWrite;
-            if (now > nextRangeDirsWrite) {
-                nextRangeDirsWrite = now + 5 * MINUTES;
-                writeRangeDirs();
+        static int64_t nextRangeDirsWrite;
+        if (now > nextRangeDirsWrite) {
+            nextRangeDirsWrite = now + 5 * MINUTES;
+            if (Modes.state_only_on_exit) {
+                nextRangeDirsWrite = now + 6 * HOURS;
             }
+            writeRangeDirs();
         }
     }
 
     // don't do everything at once ... this stuff isn't that time critical it'll get its turn
 
+    if (checkWriteState()) {
+        return;
+    }
+
     if (Modes.state_dir) {
         static uint32_t blob; // current blob
         static int64_t next_blob;
 
-        char filename[PATH_MAX];
-        snprintf(filename, PATH_MAX, "%s/writeState", Modes.state_dir);
-        int fd = open(filename, O_RDONLY);
-        if (fd > -1) {
-            next_blob = now + 45 * SECONDS;
-
-            char tmp[3];
-            int len = read(fd, tmp, 2);
-            close(fd);
-
-            tmp[2] = '\0';
-
-            if (len == 0) {
-                writeInternalState();
-            } else if (len == 2) {
-                uint32_t suffix = strtol(tmp, NULL, 16);
-                notask_save_blob(suffix);
-                fprintf(stderr, "save_blob: %02x\n", suffix);
-            }
-
-            unlink(filename);
-            // unlink only after writing state, if the file doesn't exist that's fine as well
-            // this is a hack to detect from a shell script when the task is done
-
-            return;
-        }
-
         // only continuously write state if we keep permanent trace
         if (!Modes.state_only_on_exit && now > next_blob) {
             //fprintf(stderr, "save_blob: %02x\n", blob);
-            notask_save_blob(blob);
-            blob = (blob + 1) % STATE_BLOBS;
-            next_blob = now + 60 * MINUTES / STATE_BLOBS;
+            int64_t blob_interval = Modes.state_write_interval / STATE_BLOBS;
+            next_blob = now + blob_interval;
 
+            struct timespec watch;
+            startWatch(&watch);
+
+            notask_save_blob(blob, Modes.state_dir);
+
+            int64_t elapsed = stopWatch(&watch);
+            if (elapsed > 0.5 * SECONDS || elapsed > blob_interval / 3) {
+                fprintf(stderr, "WARNING: save_blob %02x took %"PRIu64" ms!\n", blob, elapsed);
+            }
+
+            blob = (blob + 1) % STATE_BLOBS;
             return;
         }
     }
@@ -2519,6 +2584,12 @@ int main(int argc, char **argv) {
 
     for (int j = 0; j < STAT_BUCKETS; ++j)
         Modes.stats_10[j].start = Modes.stats_10[j].end = Modes.stats_current.start;
+
+    if (Modes.json_dir) {
+        char pathbuf[PATH_MAX];
+        snprintf(pathbuf, PATH_MAX, "%s/getState", Modes.json_dir);
+        mkdir_error(pathbuf, 0755, stderr);
+    }
 
     if (Modes.json_dir && Modes.json_globe_index) {
         char pathbuf[PATH_MAX];

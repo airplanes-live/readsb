@@ -191,6 +191,12 @@ static struct net_service *serviceInit(struct net_service_group *group, const ch
         service->writer->lastWrite = mstime();
         service->writer->lastReceiverId = 0;
         service->writer->connections = 0;
+
+        if (service->writer == &Modes.beast_reduce_out) {
+            service->writer->flushInterval = Modes.net_output_flush_interval_beast_reduce;
+        } else {
+            service->writer->flushInterval = Modes.net_output_flush_interval;
+        }
     }
 
     return service;
@@ -834,7 +840,7 @@ void modesInitNet(void) {
         exit(1);
     }
 
-    Modes.net_connector_delay_min = imax(50, Modes.net_connector_delay / 64);
+    Modes.net_connector_delay_min = imax(100, Modes.net_connector_delay / 64);
     Modes.last_connector_fail = Modes.next_reconnect_callback = mstime();
 
     if (!Modes.net)
@@ -1175,7 +1181,8 @@ static void modesCloseClient(struct client *c) {
         // if we were connected for some time, an immediate reconnect is expected
         con->next_reconnect = con->lastConnect + con->backoff;
 
-        Modes.last_connector_fail = Modes.next_reconnect_callback = now;
+        Modes.next_reconnect_callback = now;
+        Modes.last_connector_fail = now;
     }
 
     // mark it as inactive and ready to be freed
@@ -1468,6 +1475,7 @@ static inline int flushClient(struct client *c, int64_t now) {
 //
 static void flushWrites(struct net_writer *writer) {
     int64_t now = mstime();
+    //fprintTimePrecise(stderr, now); fprintf(stderr, "flushing %s %5d bytes\n", writer->service->descr, writer->dataUsed);
     for (struct client *c = writer->service->clients; c; c = c->next) {
         if (!c->service)
             continue;
@@ -1532,6 +1540,12 @@ static void *prepareWrite(struct net_writer *writer, int len) {
 // endptr should point one byte past the last byte written
 // to the buffer returned from prepareWrite.
 static void completeWrite(struct net_writer *writer, void *endptr) {
+    if (writer->dataUsed == 0 && endptr - writer->data > 0) {
+        int64_t now = mstime();
+        //fprintTimePrecise(stderr, now); fprintf(stderr, "completeWrite starting packet for %s\n", writer->service->descr);
+        writer->nextFlush = now + writer->flushInterval;
+    }
+
     writer->dataUsed = endptr - writer->data;
 
     if (writer->dataUsed >= Modes.net_output_flush_size) {
@@ -2112,7 +2126,8 @@ static int decodeAsterixMessage(struct client *c, char *p, int remote, int64_t n
                 }
             }
             if (fspec[2] & 0x8){ // I021/070 Mode 3/A Code
-                mm->squawk += (((*p & 0xe) << 11) + ((*p & 0x1) << 10) + ((*(p + 1) & 0xC0) << 2) + ((*(p + 1) & 0x38) << 1) + ((*(p + 1) & 0x7))) ;
+                mm->squawkHex = (((*p & 0xe) << 11) + ((*p & 0x1) << 10) + ((*(p + 1) & 0xC0) << 2) + ((*(p + 1) & 0x38) << 1) + ((*(p + 1) & 0x7))) ;
+                mm->squawkDec = squawkHex2Dec(mm->squawkHex);
                 mm->squawk_valid = true;
                 p += 2;
             }
@@ -2559,7 +2574,7 @@ static void modesSendAsterixOutput(struct modesMessage *mm, struct net_writer *w
         // I021/070 Mode 3/A Code
         if(mm->squawk_valid){
             fspec[2] |= 1 << 3;
-            uint16_t squawk = mm->squawk;
+            uint16_t squawk = mm->squawkHex;
             bytes[p]   |= ((squawk & 0x7000)) >> 11;
             bytes[p++] |= ((squawk & 0x0400)) >> 10;
             bytes[p]   |= ((squawk & 0x0300)) >> 2;
@@ -3011,9 +3026,10 @@ static int decodeSbsLine(struct client *c, char *line, int remote, int64_t now, 
     if (t[18] && strlen(t[18]) > 0) {
         long int tmp = strtol(t[18], NULL, 10);
         if (tmp > 0) {
-            mm->squawk = (tmp / 1000) * 16*16*16 + (tmp / 100 % 10) * 16*16 + (tmp / 10 % 10) * 16 + (tmp % 10);
+            mm->squawkDec = tmp;
+            mm->squawkHex = squawkDec2Hex(mm->squawkDec);
             mm->squawk_valid = 1;
-            //fprintf(stderr, "squawk: %04x %s, ", mm->squawk, t[18]);
+            //fprintf(stderr, "squawk: %04x %s, ", mm->squawkHex, t[18]);
         }
     }
     // field 19 (originally squawk change) used to indicate by some versions of mlat-server the number of receivers which contributed to the postiions
@@ -3253,8 +3269,10 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
     }
 
     // Field 18 is  the Squawk (if we have it)
-    if (mm->squawk_valid) {
-        p += sprintf(p, ",%04x", mm->squawk);
+    if (Modes.sbsOverrideSquawk != -1) {
+        p += sprintf(p, ",%04d", Modes.sbsOverrideSquawk);
+    } else if (mm->squawk_valid) {
+        p += sprintf(p, ",%04d", mm->squawkDec);
     } else {
         p += sprintf(p, ",");
     }
@@ -3283,7 +3301,7 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
         }
     } else if (mm->squawk_valid) {
         // Field 20 is the Squawk Emergency flag (if we have it)
-        if ((mm->squawk == 0x7500) || (mm->squawk == 0x7600) || (mm->squawk == 0x7700)) {
+        if ((mm->squawkHex == 0x7500) || (mm->squawkHex == 0x7600) || (mm->squawkHex == 0x7700)) {
             p += sprintf(p, ",-1");
         } else {
             p += sprintf(p, ",0");
@@ -5023,7 +5041,7 @@ static void modesReadFromClient(struct client *c, struct messageBuffer *mb) {
         if (!c->bufferToProcess) {
             // get more buffer to process
             int read = readClient(c, now);
-            //fprintf(stderr, "readClient returned: %d\n", read);
+            //fprintTimePrecise(stderr, now); fprintf(stderr, "readClient returned: %d\n", read);
             if (!read) {
                 return;
             }
@@ -5194,21 +5212,27 @@ static void handleEpoll(struct net_service_group *group, struct messageBuffer *m
     }
 }
 
-static void flushService(struct net_service *service, int64_t now) {
+static int64_t checkFlushService(struct net_service *service, int64_t now) {
+    int64_t default_wait = 1000;
     if (!service->writer) {
-        return;
+        return now + default_wait;
     }
     struct net_writer *writer = service->writer;
     if (!writer->connections) {
-        return;
+        return now + default_wait;
     }
     if (Modes.net_heartbeat_interval && service->heartbeat_out.msg
             && now - writer->lastWrite >= Modes.net_heartbeat_interval) {
         // If we have generated no messages for a while, send a heartbeat
         send_heartbeat(service);
     }
-    if (writer->dataUsed) {
+    if (writer->dataUsed && now >= writer->nextFlush) {
         flushWrites(writer);
+    }
+    if (writer->dataUsed) {
+        return writer->nextFlush;
+    } else {
+        return now + default_wait;
     }
 }
 
@@ -5245,6 +5269,7 @@ static void decodeTask(void *arg, threadpool_threadbuffers_t *buffer_group) {
 // Perform periodic network work
 //
 void modesNetPeriodicWork(void) {
+    static int64_t check_flush;
     static int64_t next_tcp_json;
     static struct timespec watch;
 
@@ -5259,13 +5284,15 @@ void modesNetPeriodicWork(void) {
     int64_t wait_ms;
     if (Modes.serial_client) {
         wait_ms = 20;
+    } else if (Modes.sdr_type != SDR_NONE) {
+        // NO WAIT WHEN USING AN SDR !! IMPORTANT !!
+        wait_ms = 0;
     } else if (Modes.net_only) {
         // wait in net-only mode (unless we get network packets, that wakes the wait immediately)
-        wait_ms = imax(200, Modes.net_output_flush_interval);
+        wait_ms = imax(0, check_flush - now); // modify wait for next flush timer
         wait_ms = imin(wait_ms, Modes.next_reconnect_callback - now); // modify wait for reconnect callback timer
         wait_ms = imax(wait_ms, 0); // don't allow negative values
     } else {
-        // NO WAIT WHEN USING AN SDR !! IMPORTANT !!
         wait_ms = 0;
     }
 
@@ -5275,9 +5302,15 @@ void modesNetPeriodicWork(void) {
     if (priorityTasksPending()) {
         sched_yield();
     }
-    Modes.net_event_count = epoll_wait(Modes.net_epfd, Modes.net_events, Modes.net_maxEvents, wait_ms);
+    Modes.net_event_count = epoll_wait(Modes.net_epfd, Modes.net_events, Modes.net_maxEvents, (int) wait_ms);
     Modes.services_in.event_progress = 0;
     Modes.services_out.event_progress = 0;
+
+    //fprintTimePrecise(stderr, now); fprintf(stderr, " event count %d wait_ms %d\n", Modes.net_event_count, (int) wait_ms);
+
+    if (0 && Modes.net_event_count > 0) {
+        fprintTimePrecise(stderr, now); fprintf(stderr, " event count %d wait_ms %d\n", Modes.net_event_count, (int) wait_ms);
+    }
 
     pthread_mutex_lock(&Threads.decode.mutex);
 
@@ -5334,24 +5367,28 @@ void modesNetPeriodicWork(void) {
 
     int64_t elapsed2 = lapWatch(&watch);
 
-    if (now > Modes.net_output_next_flush) {
-        // If we have data that has been waiting to be written for a while, write it now.
+    // If we have data that has been waiting to be written for a while, write it now.
+    if (Modes.sdr_type != SDR_NONE || now >= check_flush || Modes.net_event_count > 0) {
+        //fprintTimePrecise(stderr, now); fprintf(stderr, " checkFlush\n");
+
+        check_flush = now + 200;
+
         for (struct net_service *service = Modes.services_out.services; service->descr; service++) {
-            flushService(service, now);
+            int64_t nextFlush = checkFlushService(service, now);
+            check_flush = imin(check_flush, nextFlush);
         }
         for (struct net_service *service = Modes.services_in.services; service->descr; service++) {
-            flushService(service, now);
+            int64_t nextFlush = checkFlushService(service, now);
+            check_flush = imin(check_flush, nextFlush);
         }
-
-        Modes.net_output_next_flush = now + Modes.net_output_flush_interval;
     }
 
-    if (now > Modes.next_reconnect_callback) {
-        //fprintTimePrecise(stderr, now); fprintf(stderr, "\n");
+    if (now >= Modes.next_reconnect_callback) {
+        //fprintTimePrecise(stderr, now); fprintf(stderr, " reconnectCallback\n");
 
         int64_t since_fail = now - Modes.last_connector_fail;
-        if (since_fail < 10 * SECONDS) {
-            Modes.next_reconnect_callback = now + 5 + since_fail * Modes.net_connector_delay_min / ( 10 * SECONDS );
+        if (since_fail < 2 * SECONDS) {
+            Modes.next_reconnect_callback = now + 20 + since_fail * Modes.net_connector_delay_min / ( 3 * SECONDS );
         } else {
             Modes.next_reconnect_callback = now + Modes.net_connector_delay_min;
         }
@@ -5656,7 +5693,8 @@ static void outputMessage(struct modesMessage *mm) {
     struct aircraft *ac = mm->aircraft;
 
     // Suppress the first message when using an SDR
-    if (Modes.net && !mm->sbs_in && (Modes.net_only || Modes.net_verbatim || !ac || ac->messages > 1)) {
+    // messages with crc 0 have an explicit checksum and are more reliable, don't suppress them when there was no CRC fix performed
+    if (Modes.net && !mm->sbs_in && (Modes.net_only || Modes.net_verbatim || (mm->crc == 0 && mm->correctedbits == 0) || (ac && ac->messages > 1) || mm->msgtype == DFTYPE_MODEAC)) {
         int is_mlat = (mm->source == SOURCE_MLAT);
 
         if (mm->jsonPositionOutputEmit && Modes.json_out.connections) {

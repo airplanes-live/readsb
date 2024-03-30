@@ -994,7 +994,13 @@ int includeAircraftJson(int64_t now, struct aircraft *a) {
         fprintf(stderr, "includeAircraftJson: got NULL pointer\n");
         return 0;
     }
-    if (a->messages < 2) {
+
+    // include all aircraft with valid position
+    if (a->pos_reliable_valid.source != SOURCE_INVALID) {
+        return 1;
+    }
+
+    if (a->messages < 2 && a->addrtype != ADDR_JAERO && a->addrtype != ADDR_OTHER) {
         return 0;
     }
 
@@ -1002,13 +1008,11 @@ int includeAircraftJson(int64_t now, struct aircraft *a) {
         return 1;
     }
 
-    // include all aircraft with valid position
-    if (a->pos_reliable_valid.source != SOURCE_INVALID) {
-        return 1;
-    }
-
     // include active aircraft
     if (now < a->seen + TRACK_EXPIRE) {
+        return 1;
+    }
+    if (a->addrtype == ADDR_JAERO && now < a->seen + Modes.trackExpireJaero) {
         return 1;
     }
 
@@ -2075,15 +2079,17 @@ struct char_buffer generateVRS(int part, int n_parts, int reduced_data) {
 
     for (int j = part_start; j < part_start + part_len; j++) {
         for (a = Modes.aircraft[j]; a; a = a->next) {
-            if (a->messages < 2) { // basic filter for bad decodes
-                continue;
-            }
             if (now > a->seen + 10 * SECONDS) // don't include stale aircraft in the JSON
                 continue;
 
             // For now, suppress non-ICAO addresses
             if (a->addr & MODES_NON_ICAO_ADDRESS)
                 continue;
+
+            // also enforce same criteria as for aircraft.json
+            if (!includeAircraftJson(now, a)) {
+                continue;
+            }
 
 
             if ((p + 2048) >= end) {

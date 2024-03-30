@@ -726,13 +726,13 @@ struct _Modes
     int64_t doubleBeastReduceIntervalUntil;
     float beast_reduce_filter_distance;
     float beast_reduce_filter_altitude;
-    int32_t net_connector_delay;
-    int32_t net_connector_delay_min;
+    int64_t net_connector_delay;
+    int64_t net_connector_delay_min;
     int64_t next_reconnect_callback;
     int64_t last_connector_fail;
     int32_t net_heartbeat_interval; // TCP heartbeat interval (milliseconds)
     int32_t net_output_flush_interval; // Maximum interval (in milliseconds) between outputwrites
-    int64_t net_output_next_flush;
+    int32_t net_output_flush_interval_beast_reduce; // Maximum interval (in milliseconds) between outputwrites
     double fUserLat; // Users receiver/antenna lat/lon needed for initial surface location
     double fUserLon; // Users receiver/antenna lat/lon needed for initial surface location
     double maxRange; // Absolute maximum decoding range, in *metres*
@@ -782,6 +782,7 @@ struct _Modes
     int8_t dump_reduce; // only dump beast that would be sent out according to reduce_interval
     int8_t state_only_on_exit;
     int8_t free_aircraft;
+    int64_t state_write_interval;
     char *prom_file;
     int64_t heatmap_current_interval;
     int64_t heatmap_interval; // don't change data type
@@ -813,6 +814,7 @@ struct _Modes
     int json_aircraft_history_next;
     int json_aircraft_history_full;
     int trace_hist_only;
+    int sbsOverrideSquawk;
     float messageRateMult;
     uint32_t binCraftVersion; // never change the type for this variable
     int8_t userLocationValid;
@@ -884,6 +886,7 @@ struct modesMessage
     addrtype_t addrtype; // address format / source
     int8_t remote; // If set this message is from a remote station
     int8_t sbs_in; // Signifies this message is coming from basestation input
+    int8_t address_reliable;
     int8_t sbsMsgType; // SBS message type
     int8_t reduce_forward; // forward this message for reduced beast output
     int8_t garbage; // from garbage receiver
@@ -995,7 +998,8 @@ struct modesMessage
     int baro_rate; // Rate of change of barometric altitude, feet/minute
     int geom_rate; // Rate of change of geometric (GNSS / INS) altitude, feet/minute
     char callsign[16]; // 8 chars flight number, NUL-terminated
-    unsigned squawk; // 13 bits identity (Squawk), encoded as 4 hex digits
+    uint32_t squawkHex; // 13 bits identity (Squawk), encoded as 4 hex digits
+    uint32_t squawkDec; // Squawk as a decimal number
     unsigned category; // A0 - D7 encoded as a single hex byte
     emergency_t emergency; // emergency/priority status
 
@@ -1167,6 +1171,7 @@ enum {
     OptPromFile,
     OptGlobeHistoryDir,
     OptStateDir,
+    OptStateInterval,
     OptStateOnlyOnExit,
     OptHeatmap,
     OptHeatmapDir,
@@ -1206,8 +1211,8 @@ enum {
     OptApiShutdownDelay,
     OptTar1090UseApi,
     OptNetRoSize,
-    OptNetRoRate,
-    OptNetRoIntervall,
+    OptNetRoInterval,
+    OptNetRoIntervalBeastReduce,
     OptNetConnector,
     OptNetConnectorDelay,
     OptNetHeartbeat,
