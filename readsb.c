@@ -121,8 +121,12 @@ static void configSetDefaults(void) {
     Modes.net_heartbeat_interval = MODES_NET_HEARTBEAT_INTERVAL;
     //Modes.db_file = strdup("/usr/local/share/tar1090/git-db/aircraft.csv.gz");
     Modes.db_file = NULL;
+    Modes.latString = strdup("");
+    Modes.lonString = strdup("");
     Modes.net_input_raw_ports = strdup("0");
     Modes.net_output_raw_ports = strdup("0");
+    Modes.net_output_uat_replay_ports = strdup("0");
+    Modes.net_input_uat_ports = strdup("0");
     Modes.net_output_sbs_ports = strdup("0");
     Modes.net_input_sbs_ports = strdup("0");
     Modes.net_input_beast_ports = strdup("0");
@@ -712,51 +716,57 @@ static void *globeBinEntryPoint(void *arg) {
 }
 
 static void timingStatistics(struct mag_buf *buf) {
-    if (0) {
-        static int64_t last;
+    static int64_t last_ts;
 
-        double elapsed = buf->sysMicroseconds - last;
-        last = buf->sysMicroseconds;
+    int64_t elapsed_ts = buf->sysMicroseconds - last_ts;
 
-        static double last_elapsed;
-        // diff more than 2 ms:
-        if (fabs(elapsed - last_elapsed) > 200) {
-            fprintf(stderr, "time between USB transfers: %.0f us\n", elapsed);
-            last_elapsed = elapsed;
-        }
+    // nominal time in us between two SDR callbacks
+    int64_t nominal = Modes.sdr_buf_samples * 1000LL * 1000LL / Modes.sample_rate;
+
+    int64_t jitter = elapsed_ts - nominal;
+    if (last_ts && Modes.log_usb_jitter && fabs((double)jitter) > Modes.log_usb_jitter) {
+        fprintf(stderr, "libusb callback jitter: %6.0f us\n", (double) jitter);
     }
 
-    {
-        static int64_t last_sys;
+    static int64_t last_sys;
+    if (last_sys || buf->sampleTimestamp * (1 / 12e6) > 10) {
         static int64_t last_sample;
+        static int64_t interval;
+        int64_t nominal_interval = 30 * SECONDS * 1000;
         if (!last_sys) {
             last_sys = buf->sysMicroseconds;
             last_sample = buf->sampleTimestamp;
+            interval = nominal_interval;
         }
         double elapsed_sys = buf->sysMicroseconds - last_sys;
-        if (elapsed_sys > 30 * SECONDS * 1000) {
+        // every 30 seconds
+        if ((elapsed_sys > interval && fabs((double) jitter) < 100) || elapsed_sys > interval * 3 / 2) {
+            // adjust interval heuristically
+            interval += (nominal_interval - elapsed_sys) / 4;
             double elapsed_sample = buf->sampleTimestamp - last_sample;
             double freq_ratio = elapsed_sample / (elapsed_sys * 12.0);
-            double diff_us = elapsed_sys - elapsed_sample / 12.0;
+            double diff_us = elapsed_sample / 12.0 - elapsed_sys;
             double ppm = (freq_ratio - 1) * 1e6;
-            // ignore the first 30 seconds for alerting purposes
-            if (last_sample != 0) {
-                Modes.estimated_ppm = ppm;
-                if (fabs(ppm) > 600) {
-                    if (ppm < -1000) {
-                        int packets_lost = (int) nearbyint(ppm / -1820);
-                        Modes.stats_current.samples_lost += packets_lost * Modes.sdr_buf_samples;
-                        fprintf(stderr, "Lost %d packets (%.1f us) on USB, MLAT could be UNSTABLE, check sync! (ppm: %.0f)"
-                                "(or the system clock jumped for some reason)\n", packets_lost, diff_us, ppm);
-                    } else {
-                        fprintf(stderr, "SDR ppm out of specification (could cause MLAT issues) or local clock jumped / not syncing with ntp or chrony! ppm: %.0f\n", ppm);
-                    }
+            Modes.estimated_ppm = ppm;
+            if (Modes.devel_log_ppm && fabs(ppm) > Modes.devel_log_ppm) {
+                fprintf(stderr, "SDR ppm: %8.1f elapsed: %6.0f ms diff: %6.0f us last jitter: %6.0f\n", ppm, elapsed_sys / 1000.0, diff_us, (double) jitter);
+            }
+            if (fabs(ppm) > 600) {
+                if (ppm < -1000) {
+                    int packets_lost = (int) nearbyint(ppm / -1820);
+                    Modes.stats_current.samples_lost += packets_lost * Modes.sdr_buf_samples;
+                    fprintf(stderr, "Lost %d packets (%.1f us) on USB, MLAT could be UNSTABLE, check sync! (ppm: %.0f)"
+                            "(or the system clock jumped for some reason)\n", packets_lost, diff_us, ppm);
+                } else {
+                    fprintf(stderr, "SDR ppm out of specification (could cause MLAT issues) or local clock jumped / not syncing with ntp or chrony! ppm: %.0f\n", ppm);
                 }
             }
             last_sys = buf->sysMicroseconds;
             last_sample = buf->sampleTimestamp;
         }
     }
+
+    last_ts = buf->sysMicroseconds;
 }
 
 static void *decodeEntryPoint(void *arg) {
@@ -872,12 +882,15 @@ static void *decodeEntryPoint(void *arg) {
                 threadTimedWait(&Threads.decode, &ts, 80);
             }
             mono = mono_milli_seconds();
-            // if removeStale is late by REMOVE_STALE_INTERVAL, force it to run
             if (mono > Modes.next_remove_stale + REMOVE_STALE_INTERVAL) {
                 //fprintf(stderr, "%.3f >? %3.f\n", mono / 1000.0, (Modes.next_remove_stale + REMOVE_STALE_INTERVAL)/ 1000.0);
-                pthread_mutex_unlock(&Threads.decode.mutex);
-                priorityTasksRun();
-                pthread_mutex_lock(&Threads.decode.mutex);
+                // don't force as this can cause issues (code left in for possible re-enabling if absolutely necessary)
+                // if memory serves right the main point of this was for SDR_IFILE / faster than real time
+                if (Modes.synthetic_now) {
+                    pthread_mutex_unlock(&Threads.decode.mutex);
+                    priorityTasksRun();
+                    pthread_mutex_lock(&Threads.decode.mutex);
+                }
             }
         }
         sdrCancel();
@@ -1238,6 +1251,8 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.net_output_vrs_ports);
     sfree(Modes.net_input_raw_ports);
     sfree(Modes.net_output_raw_ports);
+    sfree(Modes.net_output_uat_replay_ports);
+    sfree(Modes.net_input_uat_ports);
     sfree(Modes.net_output_sbs_ports);
     sfree(Modes.net_input_sbs_ports);
     sfree(Modes.net_input_jaero_ports);
@@ -1248,6 +1263,8 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.uuidFile);
     sfree(Modes.dbIndex);
     sfree(Modes.db);
+    sfree(Modes.latString);
+    sfree(Modes.lonString);
 
     int i;
     for (i = 0; i < MODES_MAG_BUFFERS; ++i) {
@@ -1495,9 +1512,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.interactive_display_ttl = (int64_t) (1000 * atof(arg));
             break;
         case OptLat:
+            sfree(Modes.latString);
+            Modes.latString = strdup(arg);
             Modes.fUserLat = atof(arg);
             break;
         case OptLon:
+            sfree(Modes.lonString);
+            Modes.lonString = strdup(arg);
             Modes.fUserLon = atof(arg);
             break;
         case OptMaxRange:
@@ -1509,6 +1530,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
         case OptStatsRange:
             Modes.stats_range_histo = 1;
+            break;
+        case OptAutoExit:
+            Modes.auto_exit = atof(arg) * SECONDS;
             break;
         case OptStatsEvery:
             Modes.stats_display_interval = ((int64_t) nearbyint(atof(arg) / 10.0)) * 10 * SECONDS;
@@ -1544,13 +1568,19 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.heatmap_dir = strdup(arg);
             break;
         case OptDumpBeastDir:
-            tokenize(&arg, ",", token, maxTokens); if (!token[0]) { break; }
+            {
+                char *argdup = strdup(arg);
+                tokenize(&argdup, ",", token, maxTokens);
+                if (!token[0]) { sfree(argdup); break; }
 
-            sfree(Modes.dump_beast_dir);
-            Modes.dump_beast_dir = strdup(token[0]);
-            if (token[1]) { Modes.dump_interval = atoi(token[1]); }
-            // enable networking as this is required
-            Modes.net = 1;
+                sfree(Modes.dump_beast_dir);
+                Modes.dump_beast_dir = strdup(token[0]);
+                if (token[1]) { Modes.dump_interval = atoi(token[1]); }
+                // enable networking as this is required
+                Modes.net = 1;
+
+                sfree(argdup);
+            }
             break;
         case OptGlobeHistoryDir:
             sfree(Modes.globe_history_dir);
@@ -1637,6 +1667,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
         case OptNetRoIntervalBeastReduce:
             Modes.net_output_flush_interval_beast_reduce = (int64_t) (1000 * atof(arg));
+            break;
+        case OptNetUatReplayPorts:
+            sfree(Modes.net_output_uat_replay_ports);
+            Modes.net_output_uat_replay_ports = strdup(arg);
+            break;
+        case OptNetUatInPorts:
+            sfree(Modes.net_input_uat_ports);
+            Modes.net_input_uat_ports = strdup(arg);
             break;
         case OptNetRoPorts:
             sfree(Modes.net_output_raw_ports);
@@ -1805,8 +1843,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
         case OptDevel:
             {
-                tokenize(&arg, ",", token, maxTokens);
+                char *argdup = strdup(arg);
+                tokenize(&argdup, ",", token, maxTokens);
                 if (!token[0]) {
+                    sfree(argdup);
                     break;
                 }
                 if (strcasecmp(token[0], "lastStatus") == 0) {
@@ -1840,6 +1880,18 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                     Modes.ping_reduce = Modes.ping_reject / 2;
                 }
 
+                if (strcasecmp(token[0], "log_usb_jitter") == 0 && token[1]) {
+                    Modes.log_usb_jitter = atoi(token[1]);
+                }
+
+                if (strcasecmp(token[0], "log_ppm") == 0) {
+                    if (token[1]) {
+                        Modes.devel_log_ppm = atoi(token[1]);
+                    } else {
+                        Modes.devel_log_ppm = -1;
+                    }
+                }
+
                 if (strcasecmp(token[0], "sbs_override_squawk") == 0 && token[1]) {
                     Modes.sbsOverrideSquawk = atoi(token[1]);
                 }
@@ -1867,6 +1919,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "debugGPS") == 0) {
                     Modes.debug_gps = 1;
                 }
+
+                sfree(argdup);
             }
             break;
 
@@ -2165,6 +2219,7 @@ static void configAfterParse() {
             || (Modes.fUserLat < -90.0) // and
             || (Modes.fUserLon > 360.0) // Longitude must be -180 to +360
             || (Modes.fUserLon < -180.0)) {
+        fprintf(stderr, "INVALID lat: %s, lon: %s\n", Modes.latString, Modes.lonString);
         Modes.fUserLat = Modes.fUserLon = 0.0;
     } else if (Modes.fUserLon > 180.0) { // If Longitude is +180 to +360, make it -180 to 0
         Modes.fUserLon -= 360.0;
@@ -2174,7 +2229,7 @@ static void configAfterParse() {
     // Set the user LatLon valid flag only if either Lat or Lon are non zero. Note the Greenwich meridian
     if ((Modes.fUserLat != 0.0) || (Modes.fUserLon != 0.0)) {
         Modes.userLocationValid = 1;
-        fprintf(stderr, "Using lat: %9.4f, lon: %9.4f\n", Modes.fUserLat, Modes.fUserLon);
+        fprintf(stderr, "Using lat: %s, lon: %s\n", Modes.latString, Modes.lonString);
     }
     if (!Modes.userLocationValid || !Modes.json_dir) {
         Modes.outline_json = 0; // disable outline_json
@@ -2690,7 +2745,18 @@ int main(int argc, char **argv) {
     struct timespec mainloopTimer;
     startWatch(&mainloopTimer);
     while (!Modes.exit) {
-        if (epoll_wait(mainEpfd, events, maxEvents, 5 * SECONDS) > 0) {
+        int64_t wait_time = 5 * SECONDS;
+        if (Modes.auto_exit) {
+            int64_t now = mstime();
+            int64_t uptime = now - Modes.startup_time;
+            if (uptime + wait_time >= Modes.auto_exit) {
+                wait_time = imax(1, Modes.auto_exit - uptime);
+            }
+            if (uptime >= Modes.auto_exit) {
+                setExit(1);
+            }
+        }
+        if (epoll_wait(mainEpfd, events, maxEvents, wait_time) > 0) {
             if (Modes.exitSoon) {
                 if (Modes.apiShutdownDelay) {
                     // delay for graceful api shutdown
