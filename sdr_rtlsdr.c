@@ -57,7 +57,7 @@
 
 #include <rtl-sdr.h>
 
-#if defined(__arm__) || defined(__aarch64__)
+#if (defined(__arm__) || defined(__aarch64__)) && !defined(DISABLE_RTLSDR_ZEROCOPY_WORKAROUND)
 // Assume we need to use a bounce buffer to avoid performance problems on Pis running kernel 5.x and using zerocopy
 #  define USE_BOUNCE_BUFFER
 #endif
@@ -69,6 +69,9 @@ static struct {
     uint8_t *bounce_buffer;
     int ppm_error;
     bool digital_agc;
+    int numgains;
+    int *gains;
+    int curGain;
 } RTLSDR;
 
 //
@@ -82,6 +85,32 @@ void rtlsdrInitConfig() {
     RTLSDR.converter = NULL;
     RTLSDR.converter_state = NULL;
     RTLSDR.bounce_buffer = NULL;
+    RTLSDR.numgains = 0;
+    RTLSDR.gains = NULL;
+}
+
+void rtlsdrSetGain() {
+    if (Modes.gain == MODES_AUTO_GAIN || Modes.gain >= 520) {
+        Modes.gain = 590;
+
+        fprintf(stderr, "rtlsdr: enabling tuner AGC\n");
+        rtlsdr_set_tuner_gain_mode(RTLSDR.dev, 0);
+    } else {
+
+        int target = (Modes.gain == MODES_MAX_GAIN ? 9999 : Modes.gain);
+        int closest = -1;
+
+        for (int i = 0; i < RTLSDR.numgains; ++i) {
+            if (closest == -1 || abs(RTLSDR.gains[i] - target) < abs(RTLSDR.gains[closest] - target))
+                closest = i;
+        }
+
+        Modes.gain = RTLSDR.gains[closest];
+        rtlsdr_set_tuner_gain_mode(RTLSDR.dev, 1); // disable autogain
+        rtlsdr_set_tuner_gain(RTLSDR.dev, RTLSDR.gains[closest]);
+        fprintf(stderr, "rtlsdr: tuner gain set to %.1f dB\n",
+                rtlsdr_get_tuner_gain(RTLSDR.dev) / 10.0);
+    }
 }
 
 static void show_rtlsdr_devices() {
@@ -158,14 +187,14 @@ bool rtlsdrHandleOption(int key, char *arg) {
 
 bool rtlsdrOpen(void) {
     if (!rtlsdr_get_device_count()) {
-        fprintf(stderr, "rtlsdr: no supported devices found.\n");
+        fprintf(stderr, "FATAL: rtlsdr: no supported devices found.\n");
         return false;
     }
 
     int dev_index = 0;
     if (Modes.dev_name) {
         if ((dev_index = find_device_index(Modes.dev_name)) < 0) {
-            fprintf(stderr, "rtlsdr: no device matching '%s' found.\n", Modes.dev_name);
+            fprintf(stderr, "FATAL: rtlsdr: no device matching '%s' found.\n", Modes.dev_name);
             show_rtlsdr_devices();
             return false;
         }
@@ -175,7 +204,7 @@ bool rtlsdrOpen(void) {
     char product[256];
     char serial[256];
     if (rtlsdr_get_device_usb_strings(dev_index, manufacturer, product, serial) < 0) {
-        fprintf(stderr, "rtlsdr: error querying device #%d: %s\n", dev_index, strerror(errno));
+        fprintf(stderr, "FATAL: rtlsdr: error querying device #%d: %s\n", dev_index, strerror(errno));
         return false;
     }
 
@@ -184,52 +213,32 @@ bool rtlsdrOpen(void) {
             manufacturer, product, serial);
 
     if (rtlsdr_open(&RTLSDR.dev, dev_index) < 0) {
-        fprintf(stderr, "rtlsdr: error opening the RTLSDR device: %s\n",
+        fprintf(stderr, "FATAL: rtlsdr: error opening the RTLSDR device: %s\n",
                 strerror(errno));
         return false;
     }
 
-    // Set gain, frequency, sample rate, and reset the device
-    if (Modes.gain == MODES_AUTO_GAIN || Modes.gain >= 520) {
-        Modes.gain = 590;
-        fprintf(stderr, "rtlsdr: enabling tuner AGC\n");
-        rtlsdr_set_tuner_gain_mode(RTLSDR.dev, 0);
-    } else {
-        int *gains;
-        int numgains;
-
-        numgains = rtlsdr_get_tuner_gains(RTLSDR.dev, NULL);
-        if (numgains <= 0) {
-            fprintf(stderr, "rtlsdr: error getting tuner gains\n");
-            return false;
-        }
-
-        gains = cmalloc(numgains * sizeof (int));
-        if (rtlsdr_get_tuner_gains(RTLSDR.dev, gains) != numgains) {
-            fprintf(stderr, "rtlsdr: error getting tuner gains\n");
-            free(gains);
-            return false;
-        }
-
-        int target = (Modes.gain == MODES_MAX_GAIN ? 9999 : Modes.gain);
-        int closest = -1;
-
-        for (int i = 0; i < numgains; ++i) {
-            if (closest == -1 || abs(gains[i] - target) < abs(gains[closest] - target))
-                closest = i;
-        }
-
-        Modes.gain = gains[closest];
-        rtlsdr_set_tuner_gain(RTLSDR.dev, gains[closest]);
-        free(gains);
-        fprintf(stderr, "rtlsdr: tuner gain set to %.1f dB\n",
-                rtlsdr_get_tuner_gain(RTLSDR.dev) / 10.0);
+    RTLSDR.numgains = rtlsdr_get_tuner_gains(RTLSDR.dev, NULL);
+    if (RTLSDR.numgains <= 0) {
+        fprintf(stderr, "FATAL: rtlsdr: error getting tuner gains\n");
+        return false;
     }
+
+    RTLSDR.gains = cmalloc(RTLSDR.numgains * sizeof (int));
+    if (rtlsdr_get_tuner_gains(RTLSDR.dev, RTLSDR.gains) != RTLSDR.numgains) {
+        fprintf(stderr, "FATAL: rtlsdr: error getting tuner gains\n");
+        free(RTLSDR.gains);
+        return false;
+    }
+
+    rtlsdrSetGain();
 
     if (RTLSDR.digital_agc) {
         fprintf(stderr, "rtlsdr: enabling digital AGC\n");
         rtlsdr_set_agc_mode(RTLSDR.dev, 1);
     }
+
+    // Set frequency, sample rate, and reset the device
 
     rtlsdr_set_freq_correction(RTLSDR.dev, RTLSDR.ppm_error);
     rtlsdr_set_center_freq(RTLSDR.dev, Modes.freq);
@@ -246,14 +255,14 @@ bool rtlsdrOpen(void) {
             Modes.dc_filter,
             &RTLSDR.converter_state);
     if (!RTLSDR.converter) {
-        fprintf(stderr, "rtlsdr: can't initialize sample converter\n");
+        fprintf(stderr, "FATAL: rtlsdr: can't initialize sample converter\n");
         rtlsdrClose();
         return false;
     }
 
 #ifdef USE_BOUNCE_BUFFER
     if (!(RTLSDR.bounce_buffer = cmalloc(Modes.sdr_buf_size))) {
-        fprintf(stderr, "rtlsdr: can't allocate bounce buffer\n");
+        fprintf(stderr, "FATAL: rtlsdr: can't allocate bounce buffer\n");
         rtlsdrClose();
         return false;
     }
@@ -277,6 +286,9 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
 
     static int antiSpam;
     static int antiSpam2;
+
+    int64_t sysMicroseconds = mono_micro_seconds();
+    int64_t sysTimestamp = mstime();
 
     // simulating missed USB packets:
     if (0) {
@@ -341,8 +353,8 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
     // Get the approx system time for the start of this block
     block_duration = 1e3 * slen / Modes.sample_rate;
 
-    outbuf->sysTimestamp = mstime();
-    outbuf->sysMicroseconds = mono_micro_seconds();
+    outbuf->sysTimestamp = sysTimestamp;
+    outbuf->sysMicroseconds = sysMicroseconds;
 
     outbuf->sysTimestamp -= block_duration;
     outbuf->sysMicroseconds -= block_duration * 1000;
@@ -388,7 +400,7 @@ void rtlsdrRun() {
 
     rtlsdr_read_async(RTLSDR.dev, rtlsdrCallback, NULL, MODES_RTL_BUFFERS, Modes.sdr_buf_size);
     if (!Modes.exit) {
-        fprintf(stderr,"rtlsdr_read_async returned unexpectedly, probably lost the USB device, bailing out\n");
+        fprintf(stderr,"FATAL: rtlsdr_read_async returned unexpectedly, probably lost the USB device, bailing out\n");
     }
 }
 
@@ -407,6 +419,7 @@ void rtlsdrClose() {
         RTLSDR.converter = NULL;
     }
 
+    free(RTLSDR.gains);
     free(RTLSDR.bounce_buffer);
     RTLSDR.bounce_buffer = NULL;
 }
