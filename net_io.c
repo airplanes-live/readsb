@@ -576,10 +576,18 @@ static void serviceConnect(struct net_connector *con, int64_t now) {
         con->try_addr = con->addr_info;
     }
 
+    struct timespec watch;
+    startWatch(&watch);
+
     getnameinfo(con->try_addr->ai_addr, con->try_addr->ai_addrlen,
             con->resolved_addr, sizeof(con->resolved_addr) - 3,
             NULL, 0,
             NI_NUMERICHOST | NI_NUMERICSERV);
+
+    int64_t getnameinfoElapsed = lapWatch(&watch);
+    if (getnameinfoElapsed > 1) {
+        fprintf(stderr, "WARNING: getnameinfo() took %"PRId64" ms\n", getnameinfoElapsed);
+    }
 
     if (strcmp(con->resolved_addr, con->address) == 0) {
         con->resolved_addr[0] = '\0';
@@ -1424,7 +1432,7 @@ static int pongReceived(struct client *c, int64_t now) {
 }
 
 
-static inline int flushClient(struct client *c, int64_t now) {
+static int flushClient(struct client *c, int64_t now) {
     if (!c->service) { fprintf(stderr, "report error: Ahlu8pie\n"); return -1; }
     int toWrite = c->sendq_len;
     char *psendq = c->sendq;
@@ -1445,18 +1453,29 @@ static inline int flushClient(struct client *c, int64_t now) {
         modesCloseClient(c);
         return -1;
     }
+    if (bytesWritten > toWrite) {
+        fprintf(stderr, "%s: send() weirdness: bytesWritten > toWrite: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
+                c->service->descr, strerror(err), c->host, c->port,
+                c->fd, c->sendq_len, c->buflen);
+        modesCloseClient(c);
+        return -1;
+    }
+    if (bytesWritten < toWrite && Modes.debug_flush) {
+
+        fprintTimePrecise(stderr, now);
+        fprintf(stderr, " %s: send wrote: %d/%d bytes (%s port %s fd %d, SendQ %d)\n", c->service->descr, bytesWritten, toWrite, c->host, c->port, c->fd, c->sendq_len);
+    }
     if (bytesWritten > 0) {
         Modes.stats_current.network_bytes_out += bytesWritten;
         // Advance buffer
         psendq += bytesWritten;
         toWrite -= bytesWritten;
+        c->sendq_len -= bytesWritten;
 
         c->last_send = now;	// If we wrote anything, update this.
-        if (bytesWritten == c->sendq_len) {
-            c->sendq_len = 0;
+        if (toWrite == 0) {
             c->last_flush = now;
         } else {
-            c->sendq_len -= bytesWritten;
             memmove((void*)c->sendq, c->sendq + bytesWritten, toWrite);
         }
     }
@@ -3569,6 +3588,12 @@ static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struc
         fprintf(stderr, " gpsdebug: received from GPSD: \'%s\'\n", p);
     }
 
+    struct char_buffer msg;
+    msg.alloc = strlen(p) + 128;
+    msg.buffer = cmalloc(msg.alloc);
+    sprintf(msg.buffer, "%s\n", p);
+    msg.len = strlen(msg.buffer);
+
     // remove spaces in place
     char *d = p;
     char *s = p;
@@ -3584,29 +3609,43 @@ static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struc
         if (Modes.debug_gps) {
             fprintf(stderr, "gpsdebug: class \"TPV\" : ignoring message.\n");
         }
-        return 0;
+        goto exit;
     }
     // filter all messages which don't have lat / lon
     char *latp = strstr(p, "\"lat\":");
     char *lonp = strstr(p, "\"lon\":");
+    char *altp = strstr(p, "\"alt\":");
     if (!latp || !lonp) {
         if (Modes.debug_gps) {
             fprintf(stderr, "gpsdebug: lat / lon not present: ignoring message.\n");
         }
-        return 0;
+        goto exit;
     }
     latp += 6;
     lonp += 6;
 
     char *saveptr = NULL;
     strtok_r(latp, ",", &saveptr);
+    saveptr = NULL;
     strtok_r(lonp, ",", &saveptr);
 
     double lat = strtod(latp, NULL);
     double lon = strtod(lonp, NULL);
 
+    double alt_m = -2e6;
+    if (altp) {
+        altp += 6;
+        saveptr = NULL;
+        strtok_r(altp, ",", &saveptr);
+        alt_m = strtod(altp, NULL);
+    }
+
     if (Modes.debug_gps) {
-        fprintf(stderr, "gpsdebug: parsed lat,lon: %11.6f,%11.6f\n", lat, lon);
+        if (alt_m > -1e6) {
+            fprintf(stderr, "gpsdebug: parsed lat,lon: %11.6f,%11.6f (alt: %.0f m)\n", lat, lon, alt_m);
+        } else {
+            fprintf(stderr, "gpsdebug: parsed lat,lon: %11.6f,%11.6f (no alt)\n", lat, lon);
+        }
     }
     //fprintf(stderr, "%11.6f %11.6f\n", lat, lon);
 
@@ -3615,13 +3654,13 @@ static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struc
         if (Modes.debug_gps) {
             fprintf(stderr, "gpsdebug: lat lon implausible, ignoring\n");
         }
-        return 0;
+        goto exit;
     }
     if (fabs(lat) < 0.1 && fabs(lon) < 0.1) {
         if (Modes.debug_gps) {
             fprintf(stderr, "gpsdebug: lat lon implausible, ignoring\n");
         }
-        return 0;
+        goto exit;
     }
 
     if (Modes.debug_gps) {
@@ -3630,12 +3669,20 @@ static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struc
 
     Modes.fUserLat = lat;
     Modes.fUserLon = lon;
+    if (alt_m > -1e6) {
+        Modes.fUserAlt = alt_m;
+    }
     Modes.userLocationValid = 1;
 
     if (Modes.json_dir) {
         free(writeJsonToFile(Modes.json_dir, "receiver.json", generateReceiverJson()).buffer); // location changed
+        if (msg.len) {
+            writeJsonToFile(Modes.json_dir, "gpsd.json", msg);
+        }
     }
 
+exit:
+    free(msg.buffer);
     return 0;
 }
 

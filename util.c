@@ -117,6 +117,10 @@ int64_t mono_milli_seconds() {
     return milli;
 }
 
+int64_t getUptime() {
+    return mono_milli_seconds() - Modes.startup_time;
+}
+
 int snprintHMS(char *buf, size_t bufsize, int64_t now) {
     time_t nowTime = nearbyint(now / 1000.0);
     struct tm local;
@@ -862,9 +866,17 @@ void *check_grow_threadpool_buffer_t(threadpool_buffer_t *buffer, ssize_t newSiz
 struct char_buffer generateZstd(ZSTD_CCtx* cctx, threadpool_buffer_t *pbuffer, struct char_buffer src, int level) {
     struct char_buffer cb;
 
-    check_grow_threadpool_buffer_t(pbuffer, ZSTD_compressBound(src.len));
 
-    //fprintf(stderr, "pbuffer->size: %ld src.len %ld\n", (long) pbuffer->size, (long) src.len);
+    size_t dstCapacity = (ZSTD_compressBound(src.len) / 1024 + 1) * 1024;
+    check_grow_threadpool_buffer_t(pbuffer, dstCapacity);
+
+    if (Modes.debug_zstd) {
+        fprintf(stderr, "calling ZSTD_compressCCtx() with cctx %p dstCapacity %6zd"
+                " src.buffer %p src.len %6ld level %d src.buffer[0] 0x%02x cctx_first_byte 0x%02x\n"
+                , cctx, dstCapacity,
+                src.buffer, (long) src.len, level, (uint8_t) src.buffer[0], (uint8_t) ((uint8_t *) cctx)[0]
+               );
+    }
 
     /*
      * size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx,
@@ -874,9 +886,13 @@ struct char_buffer generateZstd(ZSTD_CCtx* cctx, threadpool_buffer_t *pbuffer, s
      */
 
     size_t compressedSize = ZSTD_compressCCtx(cctx,
-            pbuffer->buf, pbuffer->size,
+            pbuffer->buf, dstCapacity,
             src.buffer, src.len,
             level);
+
+    if (Modes.debug_zstd) {
+        fprintf(stderr, "calling ZSTD_isError() with compressedSize: %zd\n", compressedSize);
+    }
 
     if (ZSTD_isError(compressedSize)) {
         fprintf(stderr, "generateZstd() zstd error: %s\n", ZSTD_getErrorName(compressedSize));

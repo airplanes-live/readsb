@@ -526,9 +526,10 @@ struct _Modes
     input_format_t input_format; // --iformat option
     iq_convert_fn converter_function;
     char * dev_name;
-    int gain;
-    int sdrInitialized;
     pthread_mutex_t sdrControlMutex;
+    int8_t sdrInitialized;
+    int8_t sdrOpenFailed;
+    int gain;
     int dc_filter; // should we apply a DC filter?
     int enable_agc;
     sdr_type_t sdr_type; // where are we getting data from?
@@ -638,6 +639,7 @@ struct _Modes
     int8_t mode_ac; // Enable decoding of SSR Modes A & C
     int8_t mode_ac_auto; // allow toggling of A/C by Beast commands
     int8_t debug_net;
+    int8_t debug_flush;
     int8_t debug_no_discard;
     int8_t debug_nextra;
     int8_t debug_cpr;
@@ -670,6 +672,8 @@ struct _Modes
     int8_t debug_lastStatus;
     int8_t debug_gps;
     int8_t debug_planefinder;
+    int8_t debug_zstd;
+    int8_t enable_zstd;
     int8_t incrementId;
     int8_t omitGlobeFiles;
     int8_t enableAcasCsv;
@@ -740,6 +744,7 @@ struct _Modes
     int32_t net_output_flush_interval_beast_reduce; // Maximum interval (in milliseconds) between outputwrites
     double fUserLat; // Users receiver/antenna lat/lon needed for initial surface location
     double fUserLon; // Users receiver/antenna lat/lon needed for initial surface location
+    double fUserAlt; // receiver altitude AMSL in meters
     double maxRange; // Absolute maximum decoding range, in *metres*
     char *latString;
     char *lonString;

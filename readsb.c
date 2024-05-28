@@ -166,6 +166,10 @@ static void configSetDefaults(void) {
     Modes.acasFD2 = -1; // set to -1 so it's clear we don't have that fd
     Modes.sbsOverrideSquawk = -1;
 
+    Modes.fUserAlt = -2e6;
+
+    Modes.enable_zstd = 1;
+
     Modes.currentTask = "unset";
     Modes.joinTimeout = 30 * SECONDS;
 
@@ -452,8 +456,8 @@ void priorityTasksRun() {
         antiSpam = mono;
     }
 
-    //fprintf(stderr, "running for %ld ms\n", mstime() - Modes.startup_time);
-    //fprintf(stderr, "removeStale took %"PRIu64" ms, running for %ld ms\n", elapsed, now - Modes.startup_time);
+    //fprintf(stderr, "running for %ld ms\n", getUptime());
+    //fprintf(stderr, "removeStale took %"PRIu64" ms, running for %ld ms\n", elapsed, getUptime());
 
     if (Modes.updateStats) {
         Modes.currentTask = "statsReset";
@@ -495,6 +499,7 @@ static void *readerEntryPoint(void *arg) {
     srandom(get_seed());
 
     if (!sdrOpen()) {
+        Modes.sdrOpenFailed = 1;
         setExit(2); // unexpected exit
         log_with_timestamp("sdrOpen() failed, exiting!");
         return NULL;
@@ -541,7 +546,12 @@ static void *jsonEntryPoint(void *arg) {
     threadpool_buffer_t pass_buffer = { 0 };
     threadpool_buffer_t zstd_buffer = { 0 };
 
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        //if (Modes.debug_zstd) { fprintf(stderr, "calling ZSTD_createCCtx()\n"); }
+        cctx = ZSTD_createCCtx();
+        //if (Modes.debug_zstd) { fprintf(stderr, "ZSTD_createCCtx() returned %p\n", cctx); }
+    }
 
     while (!Modes.exit) {
 
@@ -591,17 +601,24 @@ static void *jsonEntryPoint(void *arg) {
         }
 
         //fprintf(stderr, "uncompressed size %ld\n", (long) cb3.len);
-        writeJsonToFile(Modes.json_dir, "aircraft.binCraft.zst", generateZstd(cctx, &zstd_buffer, cb3, 1));
+        if (Modes.enable_zstd) {
+            writeJsonToFile(Modes.json_dir, "aircraft.binCraft.zst", generateZstd(cctx, &zstd_buffer, cb3, 1));
+        }
 
         if (Modes.json_globe_index) {
             struct char_buffer cb2 = generateGlobeBin(-1, 1, &pass_buffer);
             if (Modes.enableBinGz) {
                 writeJsonToGzip(Modes.json_dir, "globeMil_42777.binCraft", cb2, 1);
             }
-            writeJsonToFile(Modes.json_dir, "globeMil_42777.binCraft.zst", ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            if (Modes.enable_zstd) {
+                writeJsonToFile(Modes.json_dir, "globeMil_42777.binCraft.zst", ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
         }
 
         end_cpu_timing(&start_time, &Modes.stats_current.aircraft_json_cpu);
+
+        //fprintTimePrecise(stderr, mstime());
+        //fprintf(stderr, " wrote --write-json-every stuff to --write-json \n");
 
         // we should exit this wait early due to a cond_signal from api.c
         threadTimedWait(&Threads.json, &ts, Modes.json_interval * 3);
@@ -674,7 +691,10 @@ static void *globeBinEntryPoint(void *arg) {
     threadpool_buffer_t pass_buffer = { 0 };
     threadpool_buffer_t zstd_buffer = { 0 };
 
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        cctx = ZSTD_createCCtx();
+    }
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -697,8 +717,10 @@ static void *globeBinEntryPoint(void *arg) {
                 writeJsonToGzip(Modes.json_dir, filename, cb2, 1);
             }
 
-            snprintf(filename, 31, "globe_%04d.binCraft.zst", index);
-            writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globe_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
 
             struct char_buffer cb3 = generateGlobeBin(index, 1, &pass_buffer);
 
@@ -707,8 +729,10 @@ static void *globeBinEntryPoint(void *arg) {
                 writeJsonToGzip(Modes.json_dir, filename, cb3, 1);
             }
 
-            snprintf(filename, 31, "globeMil_%04d.binCraft.zst", index);
-            writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb3, 1)));
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globeMil_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb3, 1)));
+            }
         }
 
         part++;
@@ -794,7 +818,7 @@ static void *decodeEntryPoint(void *arg) {
      * This rules also in case a local Mode-S Beast is connected via USB.
      */
 
-    //fprintf(stderr, "startup complete after %.3f seconds.\n", (mstime() - Modes.startup_time) / 1000.0);
+    //fprintf(stderr, "startup complete after %.3f seconds.\n", getUptime() / 1000.0);
 
     interactiveInit();
 
@@ -1027,7 +1051,7 @@ static void writeTraces(int64_t mono) {
                     Modes.triggerPastDayTraceWrite = 1; // activated for one sweep
                 }
 
-                if (elapsed > 30 * SECONDS && mstime() - Modes.startup_time > 10 * MINUTES) {
+                if (elapsed > 30 * SECONDS && getUptime() > 10 * MINUTES) {
                     fprintf(stderr, "trace writing iteration took %.1f seconds (roughly %.0f minutes), live traces will lag behind (historic traces are fine), "
                             "consider alloting more CPU cores or increasing json-trace-interval!\n",
                             elapsed / 1000.0, elapsed / (double) MINUTES);
@@ -1911,6 +1935,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "debugPlanefinder") == 0) {
                     Modes.debug_planefinder = 1;
                 }
+                if (strcasecmp(token[0], "debugFlush") == 0) {
+                    Modes.debug_flush = 1;
+                }
                 if (strcasecmp(token[0], "omitGlobeFiles") == 0) {
                     Modes.omitGlobeFiles = 1;
                 }
@@ -1925,6 +1952,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 }
                 if (strcasecmp(token[0], "debugGPS") == 0) {
                     Modes.debug_gps = 1;
+                }
+                if (strcasecmp(token[0], "debugZstd") == 0) {
+                    Modes.debug_zstd = 1;
+                }
+                if (strcasecmp(token[0], "disableZstd") == 0) {
+                    Modes.enable_zstd = 0;
+                    Modes.enableBinGz = 1;
                 }
 
                 sfree(argdup);
@@ -2113,7 +2147,10 @@ int parseCommandLine(int argc, char **argv) {
 #undef verstring
 
     if (Modes.viewadsb) {
-        doc = "vieadsb Mode-S/ADSB/TIS commandline viewer   ";
+        doc = "vieadsb Mode-S/ADSB/TIS commandline viewer "
+            "\n\nBy default, viewadsb will TCP connect to 127.0.0.1:30005 as a data source."
+            "\nTypical readsb / dump1090 installs will provide beast data on port 30005."
+            ;
     }
 
     struct argp_option *options = Modes.viewadsb ? optionsViewadsb : optionsReadsb;
@@ -2139,7 +2176,11 @@ int parseCommandLine(int argc, char **argv) {
 
     print_commandline(argc, argv);
 
-    log_with_timestamp("readsb starting up.");
+    if (Modes.viewadsb) {
+        log_with_timestamp("viewadsb starting up.");
+    } else {
+        log_with_timestamp("readsb starting up.");
+    }
     fprintf(stderr, VERSION_STRING"\n");
 
     return 0;
@@ -2622,7 +2663,7 @@ int main(int argc, char **argv) {
     // Set sane defaults
     configSetDefaults();
 
-    Modes.startup_time = mstime();
+    Modes.startup_time = mono_milli_seconds();
 
     if (lzo_init() != LZO_E_OK)
     {
@@ -2783,8 +2824,7 @@ int main(int argc, char **argv) {
     while (!Modes.exit) {
         int64_t wait_time = 5 * SECONDS;
         if (Modes.auto_exit) {
-            int64_t now = mstime();
-            int64_t uptime = now - Modes.startup_time;
+            int64_t uptime = getUptime();
             if (uptime + wait_time >= Modes.auto_exit) {
                 wait_time = imax(1, Modes.auto_exit - uptime);
             }
@@ -2908,16 +2948,38 @@ int main(int argc, char **argv) {
         destroy_task_group(Modes.traceTasks);
     }
 
-    // frees aircraft when Modes.free_aircraft is set
-    // writes state if Modes.state_dir is set
-    Modes.free_aircraft = 1;
-    writeInternalState();
-
-    if (Modes.exit != 1) {
-        log_with_timestamp("Abnormal exit.");
-        cleanup_and_exit(1);
+    if (Modes.state_dir && Modes.sdrOpenFailed) {
+        fprintf(stderr, "not saving state: SDR failed\n");
+        sfree(Modes.state_dir);
+        Modes.state_dir = NULL;
     }
 
-    log_with_timestamp("Normal exit.");
+    Modes.free_aircraft = 1;
+    // frees aircraft when Modes.free_aircraft is set
+    // writes state if Modes.state_dir is set
+    writeInternalState();
+
+    {
+        char *exitString = "Normal exit.";
+        if (Modes.exit != 1) {
+            exitString = "Abnormal exit.";
+        }
+        int64_t uptime = getUptime();
+
+        int days = uptime / (24 * HOURS);
+        uptime -= days * (24 * HOURS);
+        int hours = uptime / HOURS;
+        uptime -= hours * HOURS;
+        int minutes = uptime / MINUTES;
+        uptime -= minutes * MINUTES;
+        double seconds = uptime / (double) SECONDS;
+
+        log_with_timestamp("%s uptime: %2dd %2dh %2dm %.3fs",
+                exitString, days, hours, minutes, seconds);
+    }
+
+    if (Modes.exit != 1) {
+        cleanup_and_exit(1);
+    }
     cleanup_and_exit(0);
 }
