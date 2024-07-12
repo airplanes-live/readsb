@@ -483,7 +483,7 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
                )
             ) {
         mm->pos_ignore = 1; // don't decrement pos_reliable
-    } else if (a->pos_reliable_odd < 0.2 || a->pos_reliable_even < 0.2) {
+    } else if (a->pos_reliable_odd < 0.01f || a->pos_reliable_even < 0.01f) {
         override = 1;
     } else if (now - a->position_valid.updated > POS_RELIABLE_TIMEOUT) {
         override = 1; // no reference or older than 60 minutes, assume OK
@@ -542,7 +542,7 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
         }
     }
 
-    if (track_diff > 70.0f) {
+    if (track_diff > 70.0f && speed > 10) {
         mm->trackUnreliable = +1;
     } else if (track_diff > -1) {
         mm->trackUnreliable = -1;
@@ -557,7 +557,7 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
         speed = surface ? 120 : 900; // guess
     }
 
-    if (speed > 1 && track_diff > -1 && a->trackUnreliable < 8) {
+    if (speed > 10 && track_diff > -1 && a->trackUnreliable < 8) {
         track_bonus = speed * (90.0f - track_diff) / 90.0f;
         track_bonus *= (surface ? 0.9f : 1.0f) * (1.0f - track_age / track_max_age);
         if (a->gs < 10) {
@@ -678,10 +678,11 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
             char uuid[32]; // needs 18 chars and null byte
             sprint_uuid1(mm->receiverId, uuid);
             fprintTime(stderr, now);
-            fprintf(stderr, " %06x R%3.1f|%3.1f %s %s %s %s %4.0f%%%2ds%2dt %3.0f/%3.0f td %3.0f %8.3fkm in%4.1fs, %4.0fkt %11.6f,%11.6f->%11.6f,%11.6f biT %4.1f s %s rId %s\n",
+            fprintf(stderr, " %06x R%3.1f|%3.1f %s %2.0f %s %s %s %4.0f%%%2ds%2dt %3.0f/%3.0f td %3.0f %8.3fkm in%4.1fs, %4.0fkt %11.6f,%11.6f->%11.6f,%11.6f biT %4.1f s %s rId %s\n",
                     a->addr,
                     a->pos_reliable_odd, a->pos_reliable_even,
                     mm->cpr_odd ? "O" : "E",
+                    mm->cpr_odd ? fmin(99, (now - a->cpr_even_valid.updated) / 1000.0) : fmin(99, (now - a->cpr_odd_valid.updated) / 1000.0),
                     cpr_local == CPR_LOCAL ? "L" : (cpr_local == CPR_GLOBAL ? "G" : "S"),
                     (surface ? "S" : "A"),
                     failMessage,
@@ -1206,7 +1207,14 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
             a->receiver_distance = mm->receiver_distance;
             a->receiver_direction = bearing(Modes.fUserLat, Modes.fUserLon, a->lat, a->lon);
 
-            if (mm->source == SOURCE_ADSB || mm->source == SOURCE_ADSR) {
+            // nac_p >= 2 accuracy better than 4 nmi
+            // decoded_rc less than 5 * nmi
+            if (mm->source == SOURCE_ADSB
+                    && trackDataValid(&a->nac_p_valid) && a->nac_p >= 2
+                    && mm->decoded_rc != 0 && mm->decoded_rc < 5 * 1852
+               ) {
+                update_range_histogram(a, now);
+            } else if (mm->source == SOURCE_ADSR) {
                 update_range_histogram(a, now);
             }
 
@@ -1220,6 +1228,20 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
     if (0 && a->addr == Modes.cpr_focus) {
         fprintf(stderr, "%06x: reliability odd: %3.1f even: %3.1f status: %d\n", a->addr, a->pos_reliable_odd, a->pos_reliable_even, posReliable(a));
     }
+}
+
+static int64_t cpr_global_airborne_max_elapsed(int64_t now, struct aircraft *a) {
+    if (!trackDataValid(&a->gs_valid) || trackDataAge(now, &a->gs_valid) > 20 * SECONDS) {
+        return 10 * SECONDS;
+    }
+    int speed = imax((int64_t) a->gs, 1);
+    // max time for 500 knots gs
+    int64_t ref = 19 * SECONDS; // empirically tested
+    int64_t ival = (ref * 500) / speed;
+    // never return more than 30 seconds
+    ival = imin(30 * SECONDS, ival);
+    //fprintf(stderr, "%lld\n", (long long) ival);
+    return ival;
 }
 
 static void updatePosition(struct aircraft *a, struct modesMessage *mm, int64_t now) {
@@ -1247,8 +1269,8 @@ static void updatePosition(struct aircraft *a, struct modesMessage *mm, int64_t 
         if (mm->source != SOURCE_MLAT)
             Modes.stats_current.cpr_airborne++;
 
-        // Airborne: 10 seconds
-        max_elapsed = 10000;
+        // Airborne: determine depending on speed, fallback 10 seconds
+        max_elapsed = cpr_global_airborne_max_elapsed(now, a);
     }
 
     // If we have enough recent data, try global CPR
@@ -1349,9 +1371,8 @@ static void updatePosition(struct aircraft *a, struct modesMessage *mm, int64_t 
 
         setPosition(a, mm, now);
     } else if (location_result == -1 && a->addr == Modes.cpr_focus && !mm->duplicate) {
-        fprintf(stderr, "%5.1fs %d: mm->cpr: (%d) (%d) %s %s, %s age: %0.1f sources o: %s %s e: %s %s lpos src: %s \n",
-                (now % (600 * SECONDS)) / 1000.0,
-                location_result,
+        fprintTime(stderr, now);
+        fprintf(stderr, " mm->cpr: (%d) (%d) %s %s, %s age: %0.1f sources o: %s %s e: %s %s lpos src: %s \n",
                 mm->cpr_lat, mm->cpr_lon,
                 mm->cpr_odd ? " odd" : "even", cpr_type_string(mm->cpr_type), mm->cpr_odd ? "even" : " odd",
                 mm->cpr_odd ? fmin(999, ((double) now - a->cpr_even_valid.updated) / 1000.0) : fmin(999, ((double) now - a->cpr_odd_valid.updated) / 1000.0),
@@ -1799,6 +1820,31 @@ discard_alt:
     if (Modes.garbage_ports)
         mm->source = SOURCE_INVALID;
     return;
+}
+
+static int accept_cpr(struct aircraft *a, struct modesMessage *mm) {
+    // CPR, even
+    if (mm->cpr_valid && !mm->cpr_odd && accept_data(&a->cpr_even_valid, mm->source, mm, a, REDUCE_OFTEN)) {
+        a->cpr_even_type = mm->cpr_type;
+        a->cpr_even_lat = mm->cpr_lat;
+        a->cpr_even_lon = mm->cpr_lon;
+        compute_nic_rc_from_message(mm, a, &a->cpr_even_nic, &a->cpr_even_rc);
+        if (0 && a->addr == Modes.cpr_focus)
+            fprintf(stderr, "E \n");
+        return 1;
+    }
+
+    // CPR, odd
+    if (mm->cpr_valid && mm->cpr_odd && accept_data(&a->cpr_odd_valid, mm->source, mm, a, REDUCE_OFTEN)) {
+        a->cpr_odd_type = mm->cpr_type;
+        a->cpr_odd_lat = mm->cpr_lat;
+        a->cpr_odd_lon = mm->cpr_lon;
+        compute_nic_rc_from_message(mm, a, &a->cpr_odd_nic, &a->cpr_odd_rc);
+        if (0 && a->addr == Modes.cpr_focus)
+            fprintf(stderr, "O \n");
+        return 1;
+    }
+    return 0;
 }
 
 //
@@ -2249,26 +2295,8 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         a->oat_updated = now;
     }
 
-    // CPR, even
-    if (mm->cpr_valid && !mm->cpr_odd && accept_data(&a->cpr_even_valid, mm->source, mm, a, REDUCE_OFTEN)) {
-        a->cpr_even_type = mm->cpr_type;
-        a->cpr_even_lat = mm->cpr_lat;
-        a->cpr_even_lon = mm->cpr_lon;
-        compute_nic_rc_from_message(mm, a, &a->cpr_even_nic, &a->cpr_even_rc);
+    if (mm->cpr_valid && accept_cpr(a, mm)) {
         cpr_new = 1;
-        if (0 && a->addr == Modes.cpr_focus)
-            fprintf(stderr, "E \n");
-    }
-
-    // CPR, odd
-    if (mm->cpr_valid && mm->cpr_odd && accept_data(&a->cpr_odd_valid, mm->source, mm, a, REDUCE_OFTEN)) {
-        a->cpr_odd_type = mm->cpr_type;
-        a->cpr_odd_lat = mm->cpr_lat;
-        a->cpr_odd_lon = mm->cpr_lon;
-        compute_nic_rc_from_message(mm, a, &a->cpr_odd_nic, &a->cpr_odd_rc);
-        cpr_new = 1;
-        if (0 && a->addr == Modes.cpr_focus)
-            fprintf(stderr, "O \n");
     }
 
     if (mm->cpr_valid) {
@@ -2302,6 +2330,11 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
     }
 
 
+    if (Modes.beast_reduce_optimize_mlat) {
+        if (mm->cpr_valid || a->position_valid.source < SOURCE_ADSR) {
+            mm->reduce_forward = 1;
+        }
+    }
 
     if (mm->acas_ra_valid) {
 
@@ -3700,9 +3733,23 @@ static void position_bad(struct modesMessage *mm, struct aircraft *a) {
     }
 
     a->pos_reliable_odd -= 0.26f;
-    a->pos_reliable_odd = fmax(0, a->pos_reliable_odd);
     a->pos_reliable_even -= 0.26f;
-    a->pos_reliable_even = fmax(0, a->pos_reliable_even);
+
+    if (a->pos_reliable_odd < 0.1f || a->pos_reliable_even < 0.1f) {
+
+        // when we reach zero, reset reliable state
+        a->pos_reliable_odd = 0;
+        a->pos_reliable_even = 0;
+
+        // invalidate CPRs to start fresh
+        a->cpr_even_valid.source = SOURCE_INVALID;
+        a->cpr_odd_valid.source = SOURCE_INVALID;
+
+        // accept the CPR we just got to get going again a bit quicker
+        if (mm->cpr_valid) {
+            accept_cpr(a, mm);
+        }
+    }
 
 
     if (0 && a->addr == Modes.cpr_focus)

@@ -1746,6 +1746,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             if (atof(arg) > 0)
                 Modes.beast_reduce_filter_distance = (float) atof(arg) * 1852.0f; // convert to meters
             break;
+        case OptNetBeastReduceOptimizeMlat:
+            Modes.beast_reduce_optimize_mlat = 1;
+            break;
         case OptNetBeastReduceInterval:
             if (atof(arg) >= 0)
                 Modes.net_output_beast_reduce_interval = (int64_t) (1000 * atof(arg));
@@ -1929,6 +1932,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "messageRateMult") == 0 && token[1]) {
                     Modes.messageRateMult = atof(token[1]);
                 }
+                if (strcasecmp(token[0], "forwardMinMessages") == 0 && token[1]) {
+                    Modes.net_forward_min_messages = atoi(token[1]);
+                    fprintf(stderr, "forwardMinMessages: %u\n", Modes.net_forward_min_messages);
+                }
                 if (strcasecmp(token[0], "incrementId") == 0) {
                     Modes.incrementId = 1;
                 }
@@ -1946,6 +1953,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 }
                 if (strcasecmp(token[0], "disableAcasJson") == 0) {
                     Modes.enableAcasJson = 0;
+                }
+                if (strcasecmp(token[0], "enableConnsJson") == 0) {
+                    Modes.enableConnsJson = 1;
                 }
                 if (strcasecmp(token[0], "provokeSegfault") == 0) {
                     Modes.debug_provoke_segfault = 1;
@@ -2551,6 +2561,8 @@ static void miscStuff(int64_t now) {
     static int64_t next_clients_json;
     if (Modes.json_dir && now > next_clients_json) {
         next_clients_json = now + 10 * SECONDS;
+        if (Modes.enableConnsJson) {
+        }
         if (Modes.netIngest)
             free(writeJsonToFile(Modes.json_dir, "clients.json", generateClientsJson()).buffer);
         if (Modes.netReceiverIdJson)
@@ -2867,12 +2879,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "<3>FATAL: priorityTasksRun() interval %.1f seconds! Trying for an orderly shutdown as well as possible!\n", (double) elapsed1 / SECONDS);
                 fprintf(stderr, "<3>lockThreads() probably hung on %s\n", Modes.currentTask);
                 setExit(2);
-                break;
+                // don't break here, otherwise exitNowEventfd isn't signaled and we don't have a proper exit
+                // setExit signals exitSoonEventfd, the main loop will then signal exitNowEventfd
             }
             if (elapsed2 > 60 * SECONDS && !Modes.synthetic_now) {
                 fprintf(stderr, "<3>FATAL: removeStale() interval %.1f seconds! Trying for an orderly shutdown as well as possible!\n", (double) elapsed2 / SECONDS);
                 setExit(2);
-                break;
             }
         }
     }

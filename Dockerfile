@@ -13,9 +13,8 @@ RUN JEMALLOC_BDIR=$(mktemp -d) && \
     rm -rf $JEMALLOC_BDIR
 
 # install readsb
-RUN mkdir -p /app/git
-COPY . /app/git
-RUN cd /app/git && \
+RUN --mount=type=bind,source=.,target=/app/git \
+    cd /app/git && \
     READSB_BUILD_DIR=$(mktemp -d) && \
     cp -r /app/git/* $READSB_BUILD_DIR && \
     cd $READSB_BUILD_DIR && \
@@ -24,7 +23,7 @@ RUN cd /app/git && \
     mv viewadsb /usr/local/bin && \
     chmod +x /usr/local/bin/viewadsb /usr/local/bin/readsb && \
     make clean && \
-    make -j$(nproc) PRINT_UUIDS=yes OPTIMIZE="-O2" && \
+    make -j$(nproc) PRINT_UUIDS=yes TRACKS_UUID=yes OPTIMIZE="-O2" && \
     mv readsb /usr/local/bin/readsb-uuid && \
     mv viewadsb /usr/local/bin/viewadsb-uuid && \
     chmod +x /usr/local/bin/viewadsb-uuid && \
