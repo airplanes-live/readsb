@@ -1957,6 +1957,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "enableConnsJson") == 0) {
                     Modes.enableConnsJson = 1;
                 }
+                if (strcasecmp(token[0], "tar1090NoGlobe") == 0) {
+                    Modes.tar1090_no_globe = 1;
+                }
                 if (strcasecmp(token[0], "provokeSegfault") == 0) {
                     Modes.debug_provoke_segfault = 1;
                 }
@@ -2242,11 +2245,13 @@ static void configAfterParse() {
     cpu_set_t mask;
     if (sched_getaffinity(getpid(), sizeof(mask), &mask) == 0) {
         Modes.num_procs = CPU_COUNT(&mask);
+#if (defined(__arm__))
         if (Modes.num_procs < 2 && !Modes.preambleThreshold && Modes.sdr_type != SDR_NONE) {
             fprintf(stderr, "WARNING: Reducing preamble threshold / decoding performance as this system has only 1 core (explicitely set --preamble-threshold to disable this behaviour)!\n");
             Modes.preambleThreshold = PREAMBLE_THRESHOLD_PIZERO;
             Modes.fixDF = 0;
         }
+#endif
     }
     if (Modes.num_procs < 1) {
         Modes.num_procs = 1; // sanity check
@@ -2799,7 +2804,7 @@ int main(int argc, char **argv) {
     if (Modes.json_dir) {
         threadCreate(&Threads.json, NULL, jsonEntryPoint, NULL);
 
-        if (Modes.json_globe_index && !Modes.omitGlobeFiles) {
+        if (Modes.json_globe_index && !Modes.omitGlobeFiles && !Modes.tar1090_no_globe) {
             // globe_xxxx.json
             threadCreate(&Threads.globeJson, NULL, globeJsonEntryPoint, NULL);
         }
