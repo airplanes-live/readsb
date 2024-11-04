@@ -113,6 +113,7 @@
 #define MODES_MAG_BUFFERS       12                         // Number of magnitude buffers (should be smaller than RTL_BUFFERS for flowcontrol to work)
 #define MODES_AUTO_GAIN         -100                       // Use automatic gain
 #define MODES_MAX_GAIN          999999                     // Use max available gain
+#define MODES_RTL_AGC           590                        // Use rtl tuner agc
 #define MODEAC_MSG_BYTES        2
 
 #define MODES_PREAMBLE_US       8   // microseconds = bits
@@ -456,6 +457,10 @@ struct mag_buf
     unsigned length; // Number of valid samples _after_ overlap. Total buffer length is buf->length + Modes.trailing_samples.
     int64_t sysTimestamp; // Estimated system time at start of block
     int64_t sysMicroseconds; // sysTimestamp in microseconds
+    uint32_t loudEvents;
+    uint32_t noiseLowSamples;
+    uint32_t noiseHighSamples;
+    uint32_t padding2;
     uint16_t *data; // Magnitude data. Starts with Modes.trailing_samples worth of overlap from the previous block
 #if defined(__arm__)
     /*padding 4 bytes*/
@@ -529,6 +534,16 @@ struct _Modes
     pthread_mutex_t sdrControlMutex;
     int8_t sdrInitialized;
     int8_t sdrOpenFailed;
+    int8_t increaseGain;
+    int8_t lowerGain;
+    int8_t autoGain;
+    int8_t gainQuiet;
+    int8_t gainStartup;
+    char *gainArg;
+    uint32_t loudThreshold;
+    uint32_t noiseLowThreshold;
+    uint32_t noiseHighThreshold;
+    int minGain;
     int gain;
     int dc_filter; // should we apply a DC filter?
     int enable_agc;
@@ -577,8 +592,10 @@ struct _Modes
     struct craftArray aircraftActive;
     dbEntry *db;
     dbEntry **dbIndex;
+    struct char_buffer dbRaw;
     dbEntry *db2;
     dbEntry **db2Index;
+    struct char_buffer db2Raw;
     int64_t dbModificationTime;
     int64_t receiverCount;
     struct net_writer raw_out; // Raw output
@@ -639,6 +656,7 @@ struct _Modes
     int8_t mode_ac; // Enable decoding of SSR Modes A & C
     int8_t mode_ac_auto; // allow toggling of A/C by Beast commands
     int8_t debug_net;
+    int8_t debug_serial;
     int8_t debug_flush;
     int8_t debug_no_discard;
     int8_t debug_nextra;
@@ -691,7 +709,7 @@ struct _Modes
     int8_t netReceiverIdPrint;
     int8_t netReceiverIdJson;
     int8_t netIngest;
-    int8_t enableConnsJson;
+    int8_t enableClientsJson;
     int8_t forward_mlat; // forward beast mlat messages to beast output ports
     int8_t forward_mlat_sbs; // forward mlat messages to sbs output ports
     int8_t beast_forward_noforward;
@@ -799,6 +817,7 @@ struct _Modes
     int32_t dump_interval;
     int32_t dump_beast_index;
     uint64_t dump_lastReceiverId;
+    int8_t writeTraces;
     int8_t dump_reduce; // only dump beast that would be sent out according to reduce_interval
     int8_t state_only_on_exit;
     int8_t free_aircraft;
@@ -852,6 +871,7 @@ struct _Modes
     ALIGNED struct mag_buf mag_buffers[MODES_MAG_BUFFERS]; // Converted magnitude buffers from RTL or file input
 
     int64_t startup_time;
+    int64_t startup_time_mono;
     int64_t next_stats_update;
     int64_t next_stats_display;
     int64_t next_api_update;

@@ -318,6 +318,7 @@ static struct client *createSocketClient(struct net_service *service, int fd) {
     if ((c->fd == Modes.beast_fd) && (Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS)) {
         /* Message from a local connected Modes-S beast or GNS5894 are passed off the internet */
         c->remote = 0;
+        c->serial = 1;
     }
 
     //fprintf(stderr, "c->receiverId: %016"PRIx64"\n", c->receiverId);
@@ -530,22 +531,27 @@ static void serviceConnect(struct net_connector *con, int64_t now) {
     // make sure backoff is never too small
     con->backoff = imax(Modes.net_connector_delay_min, con->backoff);
 
-    if (con->try_addr && con->try_addr->ai_next) {
-        // we have another address to try,
-        // iterate the address info linked list
+    if (con->try_addr) {
+        // iterate the address info linked list if we have one
         con->try_addr = con->try_addr->ai_next;
-    } else {
-        // get the address info
-        if (!con->gai_request_in_progress)  {
+    }
+
+    if (!con->try_addr)  {
+        // don't resolve too often
+        if ((!con->addr_info || now - con->lastResolve > 2 * Modes.net_connector_delay) && !con->gai_request_in_progress)  {
             // launch a pthread for async getaddrinfo
-            con->try_addr = NULL;
             if (con->addr_info) {
                 freeaddrinfo(con->addr_info);
                 con->addr_info = NULL;
             }
 
-            con->gai_request_in_progress = 1;
+            pthread_mutex_lock(&con->mutex);
             con->gai_request_done = 0;
+            pthread_mutex_unlock(&con->mutex);
+
+            if (0 && Modes.debug_net) {
+                fprintf(stderr, "%s: calling getaddrinfo for %s port %s\n", con->service->descr, con->address, con->port);
+            }
 
             if (pthread_create(&con->thread, NULL, pthreadGetaddrinfo, con)) {
                 con->next_reconnect = now + Modes.net_connector_delay;
@@ -558,36 +564,38 @@ static void serviceConnect(struct net_connector *con, int64_t now) {
             return;
         }
 
-        // gai request is in progress, let's check if it's done
+        if (con->gai_request_in_progress) {
+            // gai request is in progress, let's check if it's done
 
-        pthread_mutex_lock(&con->mutex);
-        if (!con->gai_request_done) {
-            con->next_reconnect = now + 20;
-            pthread_mutex_unlock(&con->mutex);
-            return;
-        }
-        pthread_mutex_unlock(&con->mutex);
-
-        // gai request is done, join the thread that performed it
-        con->gai_request_in_progress = 0;
-
-        if (pthread_join(con->thread, NULL)) {
-            fprintf(stderr, "%s: pthread_join ERROR for %s port %s: %s\n", con->service->descr, con->address, con->port, strerror(errno));
-            con->next_reconnect = now + Modes.net_connector_delay;
-            return;
-        }
-
-        if (con->gai_error) {
-            if (!con->silent_fail) {
-                fprintf(stderr, "%s: Name resolution for %s failed: %s\n", con->service->descr, con->address, gai_strerror(con->gai_error));
+            pthread_mutex_lock(&con->mutex);
+            if (!con->gai_request_done) {
+                con->next_reconnect = now + 20;
+                pthread_mutex_unlock(&con->mutex);
+                return;
             }
-            // limit name resolution attempts via backoff
-            con->next_reconnect = now + con->backoff;
-            con->backoff = imin(Modes.net_connector_delay, 2 * con->backoff);
-            return;
+            pthread_mutex_unlock(&con->mutex);
+
+            con->gai_request_in_progress = 0;
+            // gai request is done, join the thread that performed it
+            if (pthread_join(con->thread, NULL)) {
+                fprintf(stderr, "%s: pthread_join ERROR for %s port %s: %s\n", con->service->descr, con->address, con->port, strerror(errno));
+                con->next_reconnect = now + Modes.net_connector_delay;
+                return;
+            }
+
+            if (con->gai_error) {
+                if (!con->silent_fail) {
+                    fprintf(stderr, "%s: Name resolution for %s failed: %s\n", con->service->descr, con->address, gai_strerror(con->gai_error));
+                }
+                // limit name resolution attempts via backoff
+                con->next_reconnect = now + con->backoff;
+                con->backoff = imin(Modes.net_connector_delay, 2 * con->backoff);
+                return;
+            }
+            con->lastResolve = now;
+            // SUCCESS, we got the address info
         }
 
-        // SUCCESS, we got the address info
         // start with the first element of the linked list
         con->try_addr = con->addr_info;
     }
@@ -1038,11 +1046,6 @@ void modesInitNet(void) {
     }
     serviceListen(Modes.beast_in_service, Modes.net_bind_address, Modes.net_input_beast_ports, Modes.net_epfd);
 
-    /* Beast input from local Modes-S Beast via USB */
-    if (Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS) {
-        Modes.serial_client = createSocketClient(Modes.beast_in_service, Modes.beast_fd);
-    }
-
     /* Planefinder input via network */
     planefinder_in = serviceInit(&Modes.services_in, "Planefinder TCP input", NULL, no_heartbeat, no_heartbeat, READ_MODE_PLANEFINDER, NULL, decodePfMessage);
     serviceListen(planefinder_in, Modes.net_bind_address, Modes.net_input_planefinder_ports, Modes.net_epfd);
@@ -1200,7 +1203,13 @@ static void modesCloseClient(struct client *c) {
     }
 
     epoll_ctl(Modes.net_epfd, EPOLL_CTL_DEL, c->fd, &c->epollEvent);
-    anetCloseSocket(c->fd);
+    if (c->serial) {
+        if (close(c->fd) < 0) {
+            fprintf(stderr, "Serial client close error: %s\n", strerror(errno));
+        }
+    } else {
+        anetCloseSocket(c->fd);
+    }
     c->service->connections--;
     Modes.modesClientCount--;
     if (c->service->writer) {
@@ -1457,14 +1466,13 @@ static int pongReceived(struct client *c, int64_t now) {
 static int flushClient(struct client *c, int64_t now) {
     if (!c->service) { fprintf(stderr, "report error: Ahlu8pie\n"); return -1; }
     int toWrite = c->sendq_len;
-    char *psendq = c->sendq;
 
     if (toWrite == 0) {
         c->last_flush = now;
         return 0;
     }
 
-    int bytesWritten = send(c->fd, psendq, toWrite, 0);
+    int bytesWritten = send(c->fd, c->sendq, toWrite, 0);
     int err = errno;
 
     // If we get -1, it's only fatal if it's not EAGAIN/EWOULDBLOCK
@@ -1490,7 +1498,6 @@ static int flushClient(struct client *c, int64_t now) {
     if (bytesWritten > 0) {
         Modes.stats_current.network_bytes_out += bytesWritten;
         // Advance buffer
-        psendq += bytesWritten;
         toWrite -= bytesWritten;
         c->sendq_len -= bytesWritten;
 
@@ -1501,13 +1508,13 @@ static int flushClient(struct client *c, int64_t now) {
             memmove((void*)c->sendq, c->sendq + bytesWritten, toWrite);
         }
     }
-    if (c->last_flush != now && !(c->epollEvent.events & EPOLLOUT)) {
+    if (toWrite > 0 && !(c->epollEvent.events & EPOLLOUT)) {
         // if we couldn't flush our buffer, make epoll tell us when we can write again
         c->epollEvent.events |= EPOLLOUT;
         if (epoll_ctl(Modes.net_epfd, EPOLL_CTL_MOD, c->fd, &c->epollEvent))
             perror("epoll_ctl fail:");
     }
-    if ((c->epollEvent.events & EPOLLOUT) && c->last_flush == now) {
+    if (toWrite == 0 && (c->epollEvent.events & EPOLLOUT)) {
         // if set, remove EPOLLOUT from epoll if flush was successful
         c->epollEvent.events ^= EPOLLOUT;
         if (epoll_ctl(Modes.net_epfd, EPOLL_CTL_MOD, c->fd, &c->epollEvent))
@@ -4431,7 +4438,15 @@ static int readClient(struct client *c, int64_t now) {
         nread = recv(c->fd, c->buf + c->buflen, left, 0);
     } else {
         // read instead of recv for modesbeast / gns-hulc ....
+        if (0 && Modes.debug_serial) {
+            fprintTimePrecise(stderr, mstime());
+            fprintf(stderr, " serial read ... fd: %d maxbytes: %d\n", c->fd, left);
+        }
         nread = read(c->fd, c->buf + c->buflen, left);
+        if (nread > 0 && Modes.debug_serial) {
+            fprintTimePrecise(stderr, mstime());
+            fprintf(stderr, " serial read return value: %d\n", nread);
+        }
     }
     int err = errno;
 
@@ -4449,6 +4464,9 @@ static int readClient(struct client *c, int64_t now) {
             return 0;
         }
         // Other errors
+        if (c->serial) {
+            fprintf(stderr, "Serial client read error: %s\n", strerror(err));
+        }
         if (Modes.debug_net) {
             fprintf(stderr, "%s: Socket Error: %s: %s port %s (fd %d, SendQ %d, RecvQ %d)\n",
                     c->service->descr, strerror(err), c->host, c->port,
@@ -4460,6 +4478,11 @@ static int readClient(struct client *c, int64_t now) {
 
     // End of file
     if (nread == 0) {
+        if (c->serial) {
+            // for serial this just means we're doing non-blocking reads and there are no bytes available
+            return 0;
+        }
+
         if (c->con) {
             if (Modes.synthetic_now) {
                 Modes.synthetic_now = 0;
@@ -5385,18 +5408,17 @@ void modesNetPeriodicWork(void) {
     dump_beast_check(now);
 
     int64_t wait_ms;
-    if (Modes.serial_client) {
-        wait_ms = 20;
-    } else if (Modes.sdr_type != SDR_NONE) {
+    if (Modes.sdr_type != SDR_NONE && Modes.sdr_type != SDR_MODESBEAST && Modes.sdr_type != SDR_GNS) {
         // NO WAIT WHEN USING AN SDR !! IMPORTANT !!
         wait_ms = 0;
-    } else if (Modes.net_only) {
+    } else {
         // wait in net-only mode (unless we get network packets, that wakes the wait immediately)
         wait_ms = imax(0, check_flush - now); // modify wait for next flush timer
         wait_ms = imin(wait_ms, Modes.next_reconnect_callback - now); // modify wait for reconnect callback timer
         wait_ms = imax(wait_ms, 0); // don't allow negative values
-    } else {
-        wait_ms = 0;
+        if (Modes.debug_serial) {
+            wait_ms = 1000;
+        }
     }
 
     // unlock decode mutex for waiting in handleEpoll
@@ -5409,7 +5431,9 @@ void modesNetPeriodicWork(void) {
     Modes.services_in.event_progress = 0;
     Modes.services_out.event_progress = 0;
 
-    //fprintTimePrecise(stderr, now); fprintf(stderr, " event count %d wait_ms %d\n", Modes.net_event_count, (int) wait_ms);
+    if (Modes.debug_serial && Modes.net_event_count > 0) {
+        fprintTimePrecise(stderr, mstime()); fprintf(stderr, " event count %d wait_ms %d\n", Modes.net_event_count, (int) wait_ms);
+    }
 
     if (0 && Modes.net_event_count > 0) {
         fprintTimePrecise(stderr, now); fprintf(stderr, " event count %d wait_ms %d\n", Modes.net_event_count, (int) wait_ms);
@@ -5449,10 +5473,23 @@ void modesNetPeriodicWork(void) {
         timespec_add_elapsed(&before, &after, &Modes.stats_current.background_cpu);
     }
 
-    if (Modes.serial_client) {
+    /* Beast input from local Modes-S Beast via USB */
+    if (Modes.sdrInitialized && (Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS)) {
+        if (!Modes.serial_client) {
+            if (Modes.debug_serial) {
+                fprintTimePrecise(stderr, mstime());
+                fprintf(stderr, " serial: creating socket client ... \n");
+            }
+            Modes.serial_client = createSocketClient(Modes.beast_in_service, Modes.beast_fd);
+            if (Modes.debug_serial) {
+                fprintTimePrecise(stderr, mstime());
+                fprintf(stderr, " serial: creating socket client ... done\n");
+            }
+        }
         if (Modes.serial_client->service) {
             modesReadFromClient(Modes.serial_client, mb);
-        } else {
+        }
+        if (!Modes.serial_client->service) {
             fprintf(stderr, "Serial client closed unexpectedly, exiting!\n");
             setExit(2);
         }

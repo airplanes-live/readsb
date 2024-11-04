@@ -566,6 +566,8 @@ void traceWrite(struct aircraft *a, threadpool_threadbuffers_t *buffer_group) {
         //if (Modes.debug_traceCount && ++count2 % 1000 == 0)
         //    fprintf(stderr, "recent trace write: %u\n", count2);
 
+        //fprintf(stderr, "traceWrite() recent for %06x uncompressed %4d bytes\n", a->addr, (int) recent.len);
+
         if (recent.len > 0) {
             snprintf(filename, 256, "traces/%02x/trace_recent_%s%06x.json", a->addr % 256, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
 
@@ -1604,7 +1606,7 @@ void set_globe_index (struct aircraft *a, int new_index) {
 static void traceUnlink(struct aircraft *a) {
     char filename[PATH_MAX];
 
-    if (!Modes.json_globe_index || !Modes.json_dir)
+    if (!Modes.writeTraces || !Modes.json_dir)
         return;
 
     snprintf(filename, 1024, "%s/traces/%02x/trace_recent_%s%06x.json", Modes.json_dir, a->addr % 256, (a->addr & MODES_NON_ICAO_ADDRESS) ? "~" : "", a->addr & 0xFFFFFF);
@@ -2244,7 +2246,7 @@ void traceMaintenance(struct aircraft *a, int64_t now, threadpool_buffer_t *pass
         return;
     }
 
-    if (Modes.json_globe_index) {
+    if (Modes.writeTraces) {
         if (now > a->trace_next_perm)
             a->trace_write |= WPERM;
         if (now > a->trace_next_mw)
@@ -3349,7 +3351,7 @@ static void compressACAS(char *dateDir) {
 }
 
 void checkNewDay(int64_t now) {
-    if (!Modes.globe_history_dir || !Modes.json_globe_index)
+    if (!Modes.globe_history_dir || !Modes.writeTraces)
         return;
 
     static int64_t next_check;
@@ -3413,7 +3415,7 @@ void checkNewDay(int64_t now) {
 }
 
 void checkNewDayAcas(int64_t now) {
-    if (!Modes.globe_history_dir || !Modes.json_globe_index)
+    if (!Modes.globe_history_dir || !Modes.writeTraces)
         return;
 
     struct tm utc;
@@ -3465,6 +3467,8 @@ void writeRangeDirs() {
     char pathbuf[PATH_MAX];
     snprintf(pathbuf, PATH_MAX, "%s/rangeDirs.gz", Modes.state_dir);
     gzFile gzfp = gzopen(pathbuf, "wb");
+    if (gzbuffer(gzfp, GZBUFFER_BIG) < 0)
+        fprintf(stderr, "gzbuffer fail");
     if (gzfp) {
         writeGz(gzfp, &Modes.lastRangeDirHour, sizeof(Modes.lastRangeDirHour), pathbuf);
         writeGz(gzfp, Modes.rangeDirs, sizeof(Modes.rangeDirs), pathbuf);

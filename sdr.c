@@ -211,11 +211,11 @@ void sdrClose() {
     pthread_mutex_unlock(&Modes.sdrControlMutex);
 }
 
-void sdrSetGain(){
+void sdrSetGain(char *reason){
     pthread_mutex_lock(&Modes.sdrControlMutex);
 
     if (Modes.sdrInitialized) {
-        current_handler()->setGain();
+        current_handler()->setGain(reason);
     }
 
     pthread_mutex_unlock(&Modes.sdrControlMutex);

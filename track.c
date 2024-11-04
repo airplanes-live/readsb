@@ -598,7 +598,9 @@ static int speed_check(struct aircraft *a, datasource_t source, double lat, doub
         range += 250;
     }
 
-    if (distance > 2.5f && (track_diff < 70 || track_diff == -1)) {
+    if (transmitted_speed < 0) {
+            mm->speedUnreliable = -1;
+    } else if (distance > 2.5f && (track_diff < 70 || track_diff == -1)) {
         if (distance <= range + (((float) elapsed + 50.0f) * (1.0f / 1000.0f)) * (transmitted_speed * knots_to_meterpersecond)) {
             mm->speedUnreliable = -1;
         } else if (distance > range + (((float) elapsed + 400.0f) * (1.0f / 1000.0f)) * (transmitted_speed * knots_to_meterpersecond)) {
@@ -1111,7 +1113,7 @@ static void setPosition(struct aircraft *a, struct modesMessage *mm, int64_t now
         if (
                 (valid_elapsed > 10 * MINUTES || override_elapsed < 10 * MINUTES)
                 && (mm->msgtype == 17 || (mm->addrtype == ADDR_ADSB_ICAO_NT && mm->cpr_type != CPR_SURFACE
-                        && !(a->dbFlags & (1 << 7)) && ((a->addr >= 0xa00000 && a->addr <= 0xafffff) || (a->dbFlags & (1 << 0))) ))
+                        && !a->is_df18_exception && ((a->addr >= 0xa00000 && a->addr <= 0xafffff) || (a->dbFlags & (1 << 0))) ))
                 && mm->cpr_valid
                 && status_elapsed > 5 * MINUTES
            ) {
@@ -2495,8 +2497,8 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
         }
         if (old_jaero) {
             // avoid using already received positions for JAERO input
-        } else if (mm->receiver_distance > Modes.maxRange) {
-            // ignore positions out of receiver range
+        } else if (mm->receiver_distance > Modes.maxRange && mm->source != SOURCE_JAERO) {
+            // ignore positions out of receiver range unless it's jaero
         } else if (mm->source == SOURCE_MLAT && mm->mlatEPU > 2 * a->mlatEPU
                 && imin((int)(3000.0f * logf((float)mm->mlatEPU / (float)a->mlatEPU)), TRACE_STALE * 3 / 4) > (int64_t) trackDataAge(mm->sysTimestamp, &a->pos_reliable_valid)
                 ) {

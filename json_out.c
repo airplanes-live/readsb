@@ -652,21 +652,16 @@ char *sprintAircraftObject(char *p, char *end, struct aircraft *a, int64_t now, 
             if (a->typeCode[0])
                 p = safe_snprintf(p, end, ",\"t\":\"%.*s\"", (int) sizeof(a->typeCode), a->typeCode);
             if (a->dbFlags) {
-                uint32_t dbFlags = a->dbFlags;
-                dbFlags &= ~(1 << 7);
-                p = safe_snprintf(p, end, ",\"dbFlags\":%u", dbFlags);
+                p = safe_snprintf(p, end, ",\"dbFlags\":%u", a->dbFlags);
             }
 
             if (Modes.jsonLongtype) {
-                dbEntry *e = dbGet(a->addr, Modes.dbIndex);
-                if (e) {
-                    if (e->typeLong[0])
-                        p = safe_snprintf(p, end, ",\"desc\":\"%.*s\"", (int) sizeof(e->typeLong), e->typeLong);
-                    if (e->ownOp[0])
-                        p = safe_snprintf(p, end, ",\n\"ownOp\":\"%.*s\"", (int) sizeof(e->ownOp), e->ownOp);
-                    if (e->year[0])
-                        p = safe_snprintf(p, end, ",\n\"year\":\"%.*s\"", (int) sizeof(e->year), e->year);
-                }
+                if (a->typeLong[0])
+                    p = safe_snprintf(p, end, ",\"desc\":\"%.*s\"", (int) sizeof(a->typeLong), a->typeLong);
+                if (a->ownOp[0])
+                    p = safe_snprintf(p, end, ",\n\"ownOp\":\"%.*s\"", (int) sizeof(a->ownOp), a->ownOp);
+                if (a->year[0])
+                    p = safe_snprintf(p, end, ",\n\"year\":\"%.*s\"", (int) sizeof(a->year), a->year);
             }
         }
 
@@ -1731,8 +1726,8 @@ static void checkTraceCache(struct aircraft *a, traceBuffer tb, int64_t now) {
 
 struct char_buffer generateTraceJson(struct aircraft *a, traceBuffer tb, int start, int last, threadpool_buffer_t *buffer, int64_t referenceTs) {
     struct char_buffer cb = { 0 };
-    if (!Modes.json_globe_index) {
-        return cb;
+    if (!Modes.writeTraces) {
+        fprintf(stderr, "generateTraceJson called when Modes.writeTraces not set, this is a bug, please report with configuration!\n");
     }
     int64_t now = mstime();
 
@@ -1766,19 +1761,15 @@ struct char_buffer generateTraceJson(struct aircraft *a, traceBuffer tb, int sta
             p = safe_snprintf(p, end, ",\n\"t\":\"%.*s\"", (int) sizeof(a->typeCode), a->typeCode);
         }
         if (a->typeCode[0] || a->registration[0] || a->dbFlags) {
-            uint32_t dbFlags = a->dbFlags;
-            dbFlags &= ~(1 << 7);
-            p = safe_snprintf(p, end, ",\n\"dbFlags\":%u", dbFlags);
+            p = safe_snprintf(p, end, ",\n\"dbFlags\":%u", a->dbFlags);
         }
-        dbEntry *e = dbGet(a->addr, Modes.dbIndex);
-        if (e) {
-            if (e->typeLong[0])
-                p = safe_snprintf(p, end, ",\n\"desc\":\"%.*s\"", (int) sizeof(e->typeLong), e->typeLong);
-            if (e->ownOp[0])
-                p = safe_snprintf(p, end, ",\n\"ownOp\":\"%.*s\"", (int) sizeof(e->ownOp), e->ownOp);
-            if (e->year[0])
-                p = safe_snprintf(p, end, ",\n\"year\":\"%.*s\"", (int) sizeof(e->year), e->year);
-        }
+
+        if (a->typeLong[0])
+            p = safe_snprintf(p, end, ",\"desc\":\"%.*s\"", (int) sizeof(a->typeLong), a->typeLong);
+        if (a->ownOp[0])
+            p = safe_snprintf(p, end, ",\n\"ownOp\":\"%.*s\"", (int) sizeof(a->ownOp), a->ownOp);
+        if (a->year[0])
+            p = safe_snprintf(p, end, ",\n\"year\":\"%.*s\"", (int) sizeof(a->year), a->year);
         if (p == regInfo)
             p = safe_snprintf(p, end, ",\n\"noRegData\":true");
     }
@@ -1892,10 +1883,12 @@ struct char_buffer generateReceiverJson() {
         p = safe_snprintf(p, end, ", \"dbServer\": true");
     }
 
-    if (Modes.json_globe_index && !Modes.tar1090_no_globe) {
-
+    if (Modes.writeTraces) {
+        p = safe_snprintf(p, end, ", \"haveTraces\": true");
         p = safe_snprintf(p, end, ", \"json_trace_interval\": %.1f", ((double) Modes.json_trace_interval) / (1 * SECONDS));
+    }
 
+    if (Modes.json_globe_index && !Modes.tar1090_no_globe) {
         p = safe_snprintf(p, end, ", \"globeIndexGrid\": %d", GLOBE_INDEX_GRID);
 
         p = safe_snprintf(p, end, ", \"globeIndexSpecialTiles\": [ ");
@@ -2012,11 +2005,7 @@ open:
             goto error_1;
         }
 
-        int gBufSize = 128 * 1024;
-        if (len < 16 * 1024) {
-            gBufSize = 16 * 1024;
-        }
-        gzbuffer(gzfp, gBufSize);
+        gzbuffer(gzfp, GZBUFFER_BIG);
 
         int name_len = strlen(file);
         if (name_len > 8 && strcmp("binCraft", file + (name_len - 8)) == 0) {

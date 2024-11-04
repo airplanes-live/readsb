@@ -100,6 +100,7 @@ struct client
     int fd; // File descriptor
     int8_t bufferToProcess;
     int8_t remote;
+    int8_t serial;
     int8_t bContinue;
     int8_t discard;
     int8_t processing;
@@ -167,6 +168,7 @@ struct net_connector
     int64_t connect_timeout;
     int64_t lastConnect; // timestamp for last connection establish
     int64_t backoff;
+    int64_t lastResolve;
     char resolved_addr[NI_MAXHOST+3];
     struct addrinfo *addr_info;
     struct addrinfo *try_addr; // pointer walking addr_info list

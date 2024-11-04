@@ -660,12 +660,8 @@ struct char_buffer generateStatusProm(int64_t now) {
 
     struct statsCount *sC = &(Modes.globalStatsCount);
 
-    int64_t uptime = now - Modes.startup_time;
-    if (now < Modes.startup_time)
-        uptime = 0;
-
     p = safe_snprintf(p, end, "readsb_now %"PRIu64"\n", now);
-    p = safe_snprintf(p, end, "readsb_uptime %"PRIu64"\n", uptime);
+    p = safe_snprintf(p, end, "readsb_uptime %"PRIu64"\n", getUptime());
 
     p = safe_snprintf(p, end, "readsb_aircraft_with_position %u\n", sC->readsb_aircraft_with_position);
     p = safe_snprintf(p, end, "readsb_aircraft_without_position %u\n", sC->readsb_aircraft_total - sC->readsb_aircraft_with_position);
@@ -686,11 +682,7 @@ struct char_buffer generateStatusJson(int64_t now) {
     size_t buflen = 8192;
     char *buf = (char *) cmalloc(buflen), *p = buf, *end = buf + buflen;
 
-    int64_t uptime = now - Modes.startup_time;
-    if (now < Modes.startup_time)
-        uptime = 0;
-
-    p = safe_snprintf(p, end, "{ \"now\": %.1f, \"uptime\": %.1f", now / 1000.0, uptime / 1000.0);
+    p = safe_snprintf(p, end, "{ \"now\": %.1f, \"uptime\": %.1f", now / 1000.0, getUptime() / 1000.0);
 
     p = appendTypeCounts(p, end);
 
@@ -898,15 +890,12 @@ struct char_buffer generatePromFile(int64_t now) {
             p = safe_snprintf(p, end, "readsb_demod_preambles %"PRIu32"\n", st->demod_preambles);
         }
     }
-    if (Modes.json_globe_index) {
+    if (Modes.keep_traces) {
         p = safe_snprintf(p, end, "readsb_trace_current_memory %"PRIu64"\n", Modes.trace_current_size);
         p = safe_snprintf(p, end, "readsb_trace_chunk_memory %"PRIu64"\n", Modes.trace_chunk_size);
         p = safe_snprintf(p, end, "readsb_trace_cache_memory %"PRIu64"\n", Modes.trace_cache_size);
     }
-    int64_t uptime = now - Modes.startup_time;
-    if (now < Modes.startup_time)
-        uptime = 0;
-    p = safe_snprintf(p, end, "readsb_uptime %"PRIu64"\n", uptime);
+    p = safe_snprintf(p, end, "readsb_uptime %"PRIu64"\n", getUptime());
 
     if (p >= end)
         fprintf(stderr, "buffer overrun stats prom\n");
@@ -947,7 +936,7 @@ void statsCountAircraft(int64_t now) {
         for (struct aircraft *a = Modes.aircraft[j]; a; a = a->next) {
             total_aircraft_count++;
 
-            if (Modes.json_globe_index) {
+            if (Modes.keep_traces) {
                 trace_current_size += stateBytes(a->trace_current_max);
                 trace_chunk_size += a->trace_chunk_overall_bytes;
                 struct traceCache *tCache = &a->traceCache;

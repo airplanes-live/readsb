@@ -785,7 +785,7 @@ int decodeModesMessage(struct modesMessage *mm) {
     }
 
     // these are messages of general bad quality, treat them as garbage when garbage_ports is in use.
-    if ((Modes.netIngest || Modes.garbage_ports) && mm->remote && mm->timestamp == 0 && mm->msgtype != 18) {
+    if ((Modes.netIngest || Modes.garbage_ports) && mm->remote && mm->timestamp == 0 && (mm->msgtype != 18 || mm->addrtype == ADDR_ADSB_ICAO_NT)) {
         mm->garbage = 1;
         mm->source = SOURCE_SBS;
         if (mm->addrtype >= ADDR_OTHER)

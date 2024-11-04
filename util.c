@@ -118,7 +118,7 @@ int64_t mono_milli_seconds() {
 }
 
 int64_t getUptime() {
-    return mono_milli_seconds() - Modes.startup_time;
+    return mono_milli_seconds() - Modes.startup_time_mono;
 }
 
 int snprintHMS(char *buf, size_t bufsize, int64_t now) {
@@ -379,9 +379,8 @@ struct char_buffer readWholeGz(gzFile gzfp, char *errorContext) {
     struct char_buffer cb = {0};
     if (gzbuffer(gzfp, GZBUFFER_BIG) < 0) {
         fprintf(stderr, "reading %s: gzbuffer fail!\n", errorContext);
-        return cb;
     }
-    int alloc = 8 * 1024 * 1024;
+    int alloc = 1 * 1024 * 1024;
     cb.buffer = cmalloc(alloc);
     if (!cb.buffer) {
         fprintf(stderr, "reading %s: readWholeGz alloc fail!\n", errorContext);
@@ -396,8 +395,7 @@ struct char_buffer readWholeGz(gzFile gzfp, char *errorContext) {
         cb.len += res;
         toRead -= res;
         if (toRead == 0) {
-            toRead = alloc;
-            alloc += toRead;
+            alloc *= 2;
             char *oldBuffer = cb.buffer;
             cb.buffer = realloc(cb.buffer, alloc);
             if (!cb.buffer) {
@@ -405,6 +403,7 @@ struct char_buffer readWholeGz(gzFile gzfp, char *errorContext) {
                 fprintf(stderr, "reading %s: readWholeGz alloc fail!\n", errorContext);
                 return (struct char_buffer) {0};
             }
+            toRead = alloc - cb.len;
         }
     }
     if (res < 0) {
@@ -821,6 +820,9 @@ void gzipFile(char *filename) {
         perror(fileGz);
         return;
     }
+
+    gzbuffer(gzfp, GZBUFFER_BIG);
+
     int res = gzsetparams(gzfp, 9, Z_DEFAULT_STRATEGY);
     if (res < 0) {
         fprintf(stderr, "gzsetparams fail: %d", res);

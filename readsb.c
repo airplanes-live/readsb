@@ -116,6 +116,7 @@ static void configSetDefaults(void) {
 
     // Now initialise things that should not be 0/NULL to their defaults
     Modes.gain = MODES_MAX_GAIN;
+
     Modes.freq = MODES_DEFAULT_FREQ;
     Modes.check_crc = 1;
     Modes.net_heartbeat_interval = MODES_NET_HEARTBEAT_INTERVAL;
@@ -751,6 +752,90 @@ static void *globeBinEntryPoint(void *arg) {
     return NULL;
 }
 
+static void gainStatistics(struct mag_buf *buf) {
+    static uint64_t loudEvents;
+    static uint64_t noiseLowSamples;
+    static uint64_t noiseHighSamples;
+    static uint64_t totalSamples;
+    static int slowRise;
+    static int64_t nextRaiseAgc;
+
+    loudEvents += buf->loudEvents;
+    noiseLowSamples += buf->noiseLowSamples;
+    noiseHighSamples += buf->noiseHighSamples;
+    totalSamples += buf->length;
+
+    double interval = 0.5;
+    double riseTime = 15;
+
+    if (totalSamples < interval * Modes.sample_rate) {
+        return;
+    }
+
+    double noiseLowPercent = noiseLowSamples / (double) totalSamples * 100.0;
+    double noiseHighPercent = noiseHighSamples / (double) totalSamples * 100.0;
+
+    if (!Modes.autoGain) {
+        goto reset;
+    }
+
+    // 29 gain values for typical rtl-sdr
+    // allow startup to sweep entire range quickly, almost half it for double steps
+
+    int noiseLow = noiseLowPercent > 5; // too many samples < noiseLowThreshold
+    int noiseHigh = noiseHighPercent < 1; // too few samples < noiseHighThreshold
+    int loud = loudEvents > 1;
+    int veryLoud = loudEvents > 5;
+    if (loud || noiseHigh) {
+        Modes.lowerGain = 1;
+        if (veryLoud && !Modes.gainStartup) {
+            Modes.lowerGain = 2;
+        }
+    } else if (noiseLow) {
+        if (Modes.gainStartup || slowRise > riseTime / interval) {
+            slowRise = 0;
+            Modes.increaseGain = 1;
+        } else {
+            slowRise++;
+        }
+    }
+
+
+    if (Modes.increaseGain && Modes.gain == 496 && buf->sysTimestamp < nextRaiseAgc) {
+        goto reset;
+    }
+    if (Modes.increaseGain || Modes.lowerGain) {
+        if (Modes.gainStartup) {
+            Modes.lowerGain *= Modes.gainStartup;
+            Modes.increaseGain *= Modes.gainStartup;
+        }
+        char *reason = "";
+        if (veryLoud) {
+            reason = "decreasing gain, many strong signals found: ";
+        } else if (loud) {
+            reason = "decreasing gain, strong signal found:       ";
+        } else if (noiseHigh) {
+            reason = "decreasing gain, noise too high:            ";
+        } else if (noiseLow) {
+            reason = "increasing gain, noise too low:             ";
+        }
+        sdrSetGain(reason);
+        if (Modes.gain == MODES_RTL_AGC) {
+            // switching to AGC is only done every 5 minutes to avoid oscillations due to the large step
+            nextRaiseAgc = buf->sysTimestamp + 5 * MINUTES;
+        }
+        //fprintf(stderr, "%9s gain.  noiseLow: %5.2f %%  noiseHigh: %5.2f %%  loudEvents: %4lld\n", action, noiseLowPercent, noiseHighPercent, (long long) loudEvents);
+    }
+
+reset:
+    Modes.gainStartup /= 2;
+    loudEvents = 0;
+    noiseLowSamples = 0;
+    noiseHighSamples = 0;
+    totalSamples = 0;
+}
+
+
 static void timingStatistics(struct mag_buf *buf) {
     static int64_t last_ts;
 
@@ -873,6 +958,10 @@ static void *decodeEntryPoint(void *arg) {
                     demodulate2400AC(buf);
                 }
 
+                gainStatistics(buf);
+                timingStatistics(buf);
+
+                Modes.stats_current.samples_lost += Modes.sdr_buf_samples - buf->length;
                 Modes.stats_current.samples_processed += buf->length;
                 Modes.stats_current.samples_dropped += buf->dropped;
                 end_cpu_timing(&start_time, &Modes.stats_current.demod_cpu);
@@ -882,10 +971,6 @@ static void *decodeEntryPoint(void *arg) {
                 Modes.first_filled_buffer = (Modes.first_filled_buffer + 1) % MODES_MAG_BUFFERS;
                 pthread_cond_signal(&Threads.reader.cond);
                 unlockReader();
-
-                Modes.stats_current.samples_lost += Modes.sdr_buf_samples - buf->length;
-
-                timingStatistics(buf);
 
                 watchdogCounter = 100; // roughly 10 seconds
             } else {
@@ -1138,7 +1223,7 @@ static void *upkeepEntryPoint(void *arg) {
 
         priorityTasksRun();
 
-        if (Modes.json_globe_index) {
+        if (Modes.writeTraces) {
             // writing a trace takes some time, to increase timing precision the priority tasks, allot a little less time than available
             // this isn't critical though
             int64_t time_alloted = ms_until_priority();
@@ -1437,6 +1522,60 @@ static int parseLongs(char *p, long long *results, int result_size) {
     return count;
 }
 
+static void parseGainOpt(char *arg) {
+    Modes.gainStartup = 8;
+    int maxTokens = 128;
+    char* token[maxTokens];
+    if (!arg) {
+        fprintf(stderr, "parseGainOpt called wiht argument null\n");
+        return;
+    }
+    if (strcasestr(arg, "auto") == arg) {
+        if (Modes.sdr_type != SDR_RTLSDR) {
+            fprintf(stderr, "autogain not supported for non rtl-sdr devices\n");
+        }
+        if (strcasestr(arg, "auto-verbose") == arg) {
+            fprintf(stderr, "autogain enabled, verbose mode\n");
+            Modes.gainQuiet = 0;
+        } else {
+            fprintf(stderr, "autogain enabled, silent mode, suppressing gain changing messages\n");
+            Modes.gainQuiet = 1;
+        }
+        Modes.autoGain = 1;
+        Modes.gain = 300;
+
+        char *argdup = strdup(arg);
+        tokenize(&argdup, ",", token, maxTokens);
+        if (token[1]) {
+            Modes.minGain = (int) (atof(token[1])*10); // Gain is in tens of DBs
+        } else {
+            Modes.minGain = 0;
+        }
+        if (token[2]) {
+            Modes.noiseLowThreshold = atoi(token[2]);
+        } else {
+            Modes.noiseLowThreshold = 25;
+        }
+        if (token[3]) {
+            Modes.noiseHighThreshold = atoi(token[3]);
+        } else {
+            Modes.noiseHighThreshold = 31;
+        }
+        if (token[4]) {
+            Modes.loudThreshold = atoi(token[4]);
+        } else {
+            Modes.loudThreshold = 243;
+        }
+        fprintf(stderr, "startingGain: %4.1f noiseLowThreshold: %3d noiseHighThreshold: %3d loudThreshold: %3d\n",
+                Modes.gain / 10.0, Modes.noiseLowThreshold, Modes.noiseHighThreshold, Modes.loudThreshold);
+    } else {
+        Modes.gain = (int) (atof(arg)*10); // Gain is in tens of DBs
+        Modes.autoGain = 0;
+        Modes.gainQuiet = 0;
+        Modes.minGain = 0;
+    }
+}
+
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     //fprintf(stderr, "parse_opt(%d, %s, argp_state*)\n", key, arg);
     int maxTokens = 128;
@@ -1446,7 +1585,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.dev_name = strdup(arg);
             break;
         case OptGain:
-            Modes.gain = (int) (atof(arg)*10); // Gain is in tens of DBs
+            sfree(Modes.gainArg);
+            Modes.gainArg = strdup(arg);
             break;
         case OptFreq:
             Modes.freq = (int) strtoll(arg, NULL, 10);
@@ -1924,9 +2064,12 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "log_ppm") == 0) {
                     if (token[1]) {
                         Modes.devel_log_ppm = atoi(token[1]);
-                    } else {
+                    }
+                    if (Modes.devel_log_ppm == 0) {
                         Modes.devel_log_ppm = -1;
                     }
+                    // setting to -1 to enable due to the following check
+                    // if (Modes.devel_log_ppm && fabs(ppm) > Modes.devel_log_ppm) {
                 }
 
                 if (strcasecmp(token[0], "sbs_override_squawk") == 0 && token[1]) {
@@ -1957,8 +2100,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "disableAcasJson") == 0) {
                     Modes.enableAcasJson = 0;
                 }
-                if (strcasecmp(token[0], "enableConnsJson") == 0) {
-                    Modes.enableConnsJson = 1;
+                if (strcasecmp(token[0], "enableClientsJson") == 0) {
+                    Modes.enableClientsJson = 1;
                 }
                 if (strcasecmp(token[0], "tar1090NoGlobe") == 0) {
                     Modes.tar1090_no_globe = 1;
@@ -1968,6 +2111,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 }
                 if (strcasecmp(token[0], "debugGPS") == 0) {
                     Modes.debug_gps = 1;
+                }
+                if (strcasecmp(token[0], "debugSerial") == 0) {
+                    Modes.debug_serial = 1;
                 }
                 if (strcasecmp(token[0], "debugZstd") == 0) {
                     Modes.debug_zstd = 1;
@@ -2206,8 +2352,16 @@ static void configAfterParse() {
     Modes.sdr_buf_samples = Modes.sdr_buf_size / 2;
     Modes.trackExpireMax = Modes.trackExpireJaero + TRACK_EXPIRE_LONG + 1 * MINUTES;
 
-    if (Modes.json_globe_index) {
+    if (Modes.sdr_type == SDR_RTLSDR && !Modes.gainArg) {
+        parseGainOpt("auto");
+    } else if (Modes.gainArg) {
+        parseGainOpt(Modes.gainArg);
+        sfree(Modes.gainArg);
+    }
+
+    if (Modes.json_globe_index || Modes.globe_history_dir) {
         Modes.keep_traces = 24 * HOURS + 60 * MINUTES; // include 60 minutes overlap
+        Modes.writeTraces = 1;
     } else if (Modes.heatmap || Modes.trace_focus != BADDR) {
         Modes.keep_traces = 35 * MINUTES; // heatmap is written every 30 minutes
     }
@@ -2499,10 +2653,10 @@ static void checkSetGain() {
 
     tmp[len] = '\0';
 
-    double newGain = atof(tmp);
-    Modes.gain = (int) (newGain * 10); // Gain is in tens of DBs
 
-    sdrSetGain();
+    parseGainOpt(tmp);
+
+    sdrSetGain("");
 
     //fprintf(stderr, "Modes.gain (tens of dB): %d\n", Modes.gain);
 }
@@ -2569,12 +2723,14 @@ static void miscStuff(int64_t now) {
     static int64_t next_clients_json;
     if (Modes.json_dir && now > next_clients_json) {
         next_clients_json = now + 10 * SECONDS;
-        if (Modes.enableConnsJson) {
-        }
-        if (Modes.netIngest)
+
+        if (Modes.netIngest || Modes.enableClientsJson) {
             free(writeJsonToFile(Modes.json_dir, "clients.json", generateClientsJson()).buffer);
-        if (Modes.netReceiverIdJson)
+        }
+
+        if (Modes.netReceiverIdJson) {
             free(writeJsonToFile(Modes.json_dir, "receivers.json", generateReceiversJson()).buffer);
+        }
 
         return;
     }
@@ -2683,7 +2839,8 @@ int main(int argc, char **argv) {
     // Set sane defaults
     configSetDefaults();
 
-    Modes.startup_time = mono_milli_seconds();
+    Modes.startup_time_mono = mono_milli_seconds();
+    Modes.startup_time = mstime();
 
     if (lzo_init() != LZO_E_OK)
     {
@@ -2744,7 +2901,7 @@ int main(int argc, char **argv) {
         mkdir_error(pathbuf, 0755, stderr);
     }
 
-    if (Modes.json_dir && Modes.json_globe_index) {
+    if (Modes.json_dir && Modes.writeTraces) {
         char pathbuf[PATH_MAX];
         snprintf(pathbuf, PATH_MAX, "%s/traces", Modes.json_dir);
         mkdir_error(pathbuf, 0755, stderr);
